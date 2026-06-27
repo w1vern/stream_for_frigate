@@ -108,6 +108,9 @@ class ArchiveProcess:
         self._proc = await _run(
             settings.ffmpeg, "-hide_banner", "-loglevel", "error",
             "-ss", f"{self._offset:.3f}",
+            # Pace output to ~real-time so we don't saturate the relay uplink and
+            # starve the upstream command channel. -ss seek stays instant.
+            "-readrate", f"{settings.archive_readrate:.2f}",
             "-f", "concat", "-safe", "0", "-i", self._listfile,
             "-an", "-c:v", "copy",
             "-movflags", _FMP4, "-frag_duration", "500000",

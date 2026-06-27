@@ -35,6 +35,11 @@ class Settings:
     token_ttl: int
     ffmpeg: str
     ffprobe: str
+    # Pace archive output to this multiple of real-time (ffmpeg -readrate). Sending
+    # as fast as possible saturates a thin relay link and starves the upstream
+    # command channel, so seeks get ignored. ~1.5x builds a small buffer while
+    # leaving headroom; seek-to-first-frame is unaffected (the -ss seek is instant).
+    archive_readrate: float
     # Flow-control: pause archive feeding when the client is buffered this far
     # (seconds) ahead of its playhead; resume below the low watermark.
     buffer_high: float
@@ -74,6 +79,7 @@ def load_settings() -> Settings:
         token_ttl=int(_env("TOKEN_TTL", "86400")),
         ffmpeg=_env("FFMPEG", "ffmpeg"),
         ffprobe=_env("FFPROBE", "ffprobe"),
+        archive_readrate=float(_env("ARCHIVE_READRATE", "1.5")),
         buffer_high=float(_env("BUFFER_HIGH", "20")),
         buffer_low=float(_env("BUFFER_LOW", "10")),
     )
