@@ -3,11 +3,18 @@ and media (binary). Mirrors the Hik-Connect idea — a single persistent session
 instead of many short HTTP round-trips.
 
 Binary frames from server -> client are tagged by a 1-byte type prefix:
-    0x01  media   : remaining bytes are fMP4 to append to the SourceBuffer
-    0x02  preview : 8-byte big-endian float64 (epoch time) + JPEG bytes
+    0x01  media   : [0x01][gen uint32][fMP4] to append to the SourceBuffer
+    0x02  preview : [0x02][epoch float64][JPEG] scrub thumbnail
 
-Text frames (JSON) carry control in both directions; see ``_handle`` and the
+Text frames (JSON) carry control in both directions; see ``handle`` and the
 ``init`` / ``bounds`` / ``error`` messages below.
+
+All outbound writes go through a single ``_writer`` task fed by two queues. The
+receive loop and the media pump never touch the socket directly: they enqueue
+and return. This is essential — if the receive loop blocked on a socket write
+(which stalls under relay backpressure), it would stop processing commands and
+seeks would be silently ignored. Control messages take priority over media so an
+``init`` is never stuck behind a backed-up media queue.
 """
 
 from __future__ import annotations
@@ -19,14 +26,16 @@ import struct
 from fastapi import WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
-from . import db
-
-from . import streamer
+from . import db, streamer
 from .auth import verify_token
 from .config import settings
 
 MEDIA = b"\x01"
 PREVIEW = b"\x02"
+
+# Bound the media queue so a slow client (relay backpressure) makes the pump
+# block on put() -> ffmpeg blocks -> natural backpressure, without unbounded RAM.
+MEDIA_QUEUE_MAX = 256
 
 
 class Session:
@@ -35,22 +44,55 @@ class Session:
     def __init__(self, ws: WebSocket):
         self.ws = ws
         self._task: asyncio.Task | None = None
+        self._writer_task: asyncio.Task | None = None
         self._archive: streamer.ArchiveProcess | None = None
         self._live: streamer.LiveProcess | None = None
+        # Outbound queues drained by the single _writer task.
+        self._ctrlq: asyncio.Queue[bytes | str] = asyncio.Queue()
+        self._mediaq: asyncio.Queue[bytes] = asyncio.Queue(maxsize=MEDIA_QUEUE_MAX)
+        self._has_output = asyncio.Event()
         # Flow control (archive only): seconds the client is buffered ahead.
         self._ahead = 0.0
         self._resume = asyncio.Event()
         self._resume.set()
-        # Bumped on every new stream; acks from an earlier stream carry a stale
-        # gen and are ignored, so a leftover "buffer full" ack can't pause the
-        # freshly started one (the cause of the every-other-seek black screen).
+        # Bumped on every new stream; tags media frames and is echoed in acks so
+        # stale frames/acks from a previous stream are dropped after a seek.
         self._gen = 0
-        # Serializes ALL writes to the socket. The pump task (media) and the
-        # receive loop (scrub previews / json) would otherwise call send
-        # concurrently; `websockets` forbids overlapping drains and asserts,
-        # killing the connection — which is exactly what broke scrubbing once
-        # latency (the relay) made drains actually block.
-        self._send_lock = asyncio.Lock()
+
+    # -- writer -------------------------------------------------------------
+    def start_writer(self) -> None:
+        self._writer_task = asyncio.create_task(self._writer())
+
+    async def _writer(self) -> None:
+        try:
+            while True:
+                sent = False
+                while not self._ctrlq.empty():           # control has priority
+                    await self._raw_send(self._ctrlq.get_nowait())
+                    sent = True
+                if not self._mediaq.empty():
+                    await self._raw_send(self._mediaq.get_nowait())
+                    sent = True
+                if not sent:
+                    await self._has_output.wait()
+                    self._has_output.clear()
+        except (WebSocketDisconnect, RuntimeError, ConnectionError):
+            pass
+
+    async def _raw_send(self, data: bytes | str) -> None:
+        if self.ws.application_state != WebSocketState.CONNECTED:
+            raise ConnectionError("websocket closed")
+        if isinstance(data, (bytes, bytearray)):
+            await self.ws.send_bytes(data)
+        else:
+            await self.ws.send_text(data)
+
+    def _enqueue_ctrl(self, data: bytes | str) -> None:
+        self._ctrlq.put_nowait(data)
+        self._has_output.set()
+
+    async def _send_json(self, obj: dict) -> None:
+        self._enqueue_ctrl(json.dumps(obj))
 
     # -- lifecycle ----------------------------------------------------------
     async def stop(self) -> None:
@@ -67,6 +109,19 @@ class Session:
         if self._live:
             await self._live.stop()
             self._live = None
+        # Drop any media still queued from the stream we just stopped.
+        while not self._mediaq.empty():
+            self._mediaq.get_nowait()
+
+    async def close(self) -> None:
+        await self.stop()
+        if self._writer_task:
+            self._writer_task.cancel()
+            try:
+                await self._writer_task
+            except asyncio.CancelledError:
+                pass
+            self._writer_task = None
 
     def set_ahead(self, seconds: float, gen: int) -> None:
         if gen != self._gen:
@@ -90,9 +145,7 @@ class Session:
         self._gen += 1
         self._ahead = 0.0
         self._resume.set()
-        # stream_start: epoch of the first frame the client will see. ffmpeg
-        # seeks to the keyframe at/just before ``offset`` and rebases PTS to 0,
-        # so currentTime 0 maps to roughly ``t`` (within one GOP).
+        # streamStart: epoch the client maps currentTime 0 to (within one GOP).
         await self._send_json({
             "type": "init", "mode": "archive", "camera": camera, "gen": self._gen,
             "codecs": codecs, "streamStart": first.start + offset,
@@ -111,7 +164,8 @@ class Session:
                 if not chunk:
                     await self._send_json({"type": "ended"})
                     break
-                await self._send_bytes(header + chunk)
+                await self._mediaq.put(header + chunk)
+                self._has_output.set()
         except (WebSocketDisconnect, RuntimeError, ConnectionError):
             pass
 
@@ -145,7 +199,8 @@ class Session:
                 if not chunk:
                     await self._send_json({"type": "ended"})
                     break
-                await self._send_bytes(header + chunk)
+                await self._mediaq.put(header + chunk)
+                self._has_output.set()
         except (WebSocketDisconnect, RuntimeError, ConnectionError):
             pass
 
@@ -156,18 +211,8 @@ class Session:
             return
         offset = max(0.0, t - seg.start)
         jpeg = await streamer.preview_jpeg(seg, offset)
-        if jpeg and self.ws.application_state == WebSocketState.CONNECTED:
-            await self._send_bytes(PREVIEW + struct.pack(">d", t) + jpeg)
-
-    async def _send_bytes(self, data: bytes) -> None:
-        if self.ws.application_state == WebSocketState.CONNECTED:
-            async with self._send_lock:
-                await self.ws.send_bytes(data)
-
-    async def _send_json(self, obj: dict) -> None:
-        if self.ws.application_state == WebSocketState.CONNECTED:
-            async with self._send_lock:
-                await self.ws.send_text(json.dumps(obj))
+        if jpeg:
+            self._enqueue_ctrl(PREVIEW + struct.pack(">d", t) + jpeg)
 
 
 async def handle(ws: WebSocket) -> None:
@@ -187,6 +232,7 @@ async def handle(ws: WebSocket) -> None:
         return
 
     await ws.send_text(json.dumps({"type": "ready", "cameras": db.list_cameras()}))
+    session.start_writer()
 
     try:
         while True:
@@ -199,7 +245,7 @@ async def handle(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
-        await session.stop()
+        await session.close()
 
 
 async def _dispatch(session: Session, msg: dict) -> None:
