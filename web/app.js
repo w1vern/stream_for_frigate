@@ -25,6 +25,12 @@ let sourceBuffer = null;
 const appendQueue = [];
 let streamStart = 0; // epoch of currentTime 0 (archive)
 let streamGen = 0;   // server stream generation; echoed in acks to drop stale ones
+// Credit-window flow control: count media bytes received for the current stream
+// and ack them back so the server keeps only a bounded amount in flight. Reset on
+// every new stream (init). `lastAckBytes` throttles how often we ack.
+let recvBytes = 0;
+let lastAckBytes = 0;
+const ACK_EVERY = 32 * 1024;
 let archiveBounds = null; // {start, end}
 let scrubbing = false;
 // Scrub previews are paced one-in-flight (request/response) instead of on a
@@ -142,7 +148,14 @@ function onBinary(bytes) {
     // the relay) and would otherwise be appended to the new buffer, snapping
     // playback to wherever the old stream was.
     const gen = new DataView(bytes.buffer, bytes.byteOffset + 1, 4).getUint32(0, false);
-    if (gen === streamGen) enqueueMedia(payload.subarray(4));
+    if (gen === streamGen) {
+      const media = payload.subarray(4);
+      recvBytes += media.length;
+      enqueueMedia(media);
+      // Ack received bytes promptly so the server's credit window stays open and
+      // throughput isn't throttled by the ack interval.
+      if (recvBytes - lastAckBytes >= ACK_EVERY) sendAck();
+    }
   } else if (type === 0x02) {
     // 8-byte float64 (epoch) + JPEG
     const t = new DataView(bytes.buffer, bytes.byteOffset + 1, 8).getFloat64(0, false);
@@ -174,6 +187,8 @@ function setupMediaSource(msg) {
   mode = msg.mode;
   streamStart = msg.streamStart || 0;
   streamGen = msg.gen || 0;
+  recvBytes = 0;
+  lastAckBytes = 0;
   badge.classList.toggle("hidden", mode !== "live");
 
   mediaSource = new MediaSource();
@@ -376,6 +391,23 @@ function showPreview(t, jpegBytes) {
   pumpScrub(); // fire the next pending position, if any
 }
 
+// Tell the server our progress: cumulative bytes received (credit window) and
+// seconds buffered ahead (soft prefetch cap, archive). Tagged with the stream gen
+// so the server drops acks left over from a previous stream. Sent both on receipt
+// (to keep the window open) and on a heartbeat (so a freshly seeked or stalled
+// stream still gets credit even when no media is arriving).
+function sendAck() {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !streamGen) return;
+  let ahead = 0;
+  try {
+    if (video.buffered.length) {
+      ahead = Math.max(0, video.buffered.end(video.buffered.length - 1) - video.currentTime);
+    }
+  } catch {}
+  send({ type: "ack", gen: streamGen, recv: recvBytes, aheadSec: ahead });
+  lastAckBytes = recvBytes;
+}
+
 // ---- Periodic UI + flow control ------------------------------------------
 setInterval(() => {
   drainQueue();    // recover if a prior append stalled (e.g. after eviction)
@@ -386,18 +418,10 @@ setInterval(() => {
       playheadEl.style.left = `${timeToX(t)}px`;
       clockEl.textContent = fmtClock(t);
     }
-    // Flow control: tell the server how far we are buffered ahead. Send EVERY
-    // tick (even with an empty buffer -> aheadSec 0) so a freshly seeked stream
-    // always gets a resume signal; tag it with the stream gen so the server can
-    // drop acks left over from the previous stream. Read the element's buffered
-    // (always safe) rather than the SourceBuffer's (throws once detached).
-    const ahead = video.buffered.length
-      ? Math.max(0, video.buffered.end(video.buffered.length - 1) - video.currentTime)
-      : 0;
-    send({ type: "ack", gen: streamGen, aheadSec: ahead });
   } else if (mode === "live") {
     clockEl.textContent = fmtClock(Date.now() / 1000);
   }
+  if (!scrubbing) sendAck(); // heartbeat (both modes)
 }, 500);
 
 function renderRange() {

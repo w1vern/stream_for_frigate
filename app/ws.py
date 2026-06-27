@@ -51,10 +51,19 @@ class Session:
         self._ctrlq: asyncio.Queue[bytes | str] = asyncio.Queue()
         self._mediaq: asyncio.Queue[bytes] = asyncio.Queue(maxsize=MEDIA_QUEUE_MAX)
         self._has_output = asyncio.Event()
-        # Flow control (archive only): seconds the client is buffered ahead.
-        self._ahead = 0.0
+        # Soft prefetch cap (archive only): seconds the client is buffered ahead.
         self._resume = asyncio.Event()
         self._resume.set()
+        # Credit window: bytes sent vs. bytes the client has acked receiving, for
+        # the current stream. The pump stops once `_sent - _acked` reaches the
+        # window, so at most `flow_window_bytes` are ever in flight across the
+        # whole path. `_can_send` is set while there's credit. Reset on every new
+        # stream. This is what bounds seek/switch latency over a buffered relay.
+        self._window = settings.flow_window_bytes
+        self._sent = 0
+        self._acked = 0
+        self._can_send = asyncio.Event()
+        self._can_send.set()
         # Bumped on every new stream; tags media frames and is echoed in acks so
         # stale frames/acks from a previous stream are dropped after a seek.
         self._gen = 0
@@ -123,14 +132,30 @@ class Session:
                 pass
             self._writer_task = None
 
-    def set_ahead(self, seconds: float, gen: int) -> None:
+    def set_progress(self, gen: int, recv: int | None, ahead: float) -> None:
         if gen != self._gen:
             return  # stale ack from a previous stream
-        self._ahead = seconds
-        if seconds <= settings.buffer_low:
+        # Credit window: client reports cumulative bytes received for this stream.
+        if recv is None:
+            self._can_send.set()  # client without byte-acks -> don't gate on credit
+        else:
+            self._acked = recv
+            if self._sent - self._acked < self._window:
+                self._can_send.set()
+            else:
+                self._can_send.clear()
+        # Soft prefetch cap (archive): don't read more than buffer_high s ahead.
+        if ahead <= settings.buffer_low:
             self._resume.set()
-        elif seconds >= settings.buffer_high:
+        elif ahead >= settings.buffer_high:
             self._resume.clear()
+
+    def _reset_flow(self) -> None:
+        """Reset credit + prefetch gates for a freshly started stream."""
+        self._sent = 0
+        self._acked = 0
+        self._can_send.set()
+        self._resume.set()
 
     # -- archive ------------------------------------------------------------
     async def play(self, camera: str, t: float) -> None:
@@ -143,8 +168,7 @@ class Session:
         offset = max(0.0, t - first.start)
         codecs = await streamer.codecs_for(camera, first.path)
         self._gen += 1
-        self._ahead = 0.0
-        self._resume.set()
+        self._reset_flow()
         # streamStart: epoch the client maps currentTime 0 to (within one GOP).
         await self._send_json({
             "type": "init", "mode": "archive", "camera": camera, "gen": self._gen,
@@ -159,13 +183,17 @@ class Session:
         header = MEDIA + struct.pack(">I", self._gen)
         try:
             while True:
-                await self._resume.wait()
+                await self._resume.wait()    # soft prefetch cap
+                await self._can_send.wait()  # credit window
                 chunk = await self._archive.read()
                 if not chunk:
                     await self._send_json({"type": "ended"})
                     break
                 await self._mediaq.put(header + chunk)
                 self._has_output.set()
+                self._sent += len(chunk)
+                if self._sent - self._acked >= self._window:
+                    self._can_send.clear()
         except (WebSocketDisconnect, RuntimeError, ConnectionError):
             pass
 
@@ -180,8 +208,7 @@ class Session:
         seg = db.segment_at(camera, db.bounds(camera)[1] - 1) if db.bounds(camera) else None
         codecs = await streamer.codecs_for(camera, seg.path) if seg else ["avc1.640029", "avc1.4D0028"]
         self._gen += 1
-        self._ahead = 0.0
-        self._resume.set()
+        self._reset_flow()
         await self._send_json({
             "type": "init", "mode": "live", "camera": camera, "gen": self._gen,
             "codecs": codecs,
@@ -195,12 +222,16 @@ class Session:
         header = MEDIA + struct.pack(">I", self._gen)
         try:
             while True:
+                await self._can_send.wait()  # credit window (bounds live backlog)
                 chunk = await self._live.read()
                 if not chunk:
                     await self._send_json({"type": "ended"})
                     break
                 await self._mediaq.put(header + chunk)
                 self._has_output.set()
+                self._sent += len(chunk)
+                if self._sent - self._acked >= self._window:
+                    self._can_send.clear()
         except (WebSocketDisconnect, RuntimeError, ConnectionError):
             pass
 
@@ -257,7 +288,12 @@ async def _dispatch(session: Session, msg: dict) -> None:
     elif kind == "scrub":
         await session.scrub(msg["camera"], float(msg["time"]))
     elif kind == "ack":
-        session.set_ahead(float(msg.get("aheadSec", 0)), int(msg.get("gen", -1)))
+        recv = msg.get("recv")
+        session.set_progress(
+            int(msg.get("gen", -1)),
+            int(recv) if recv is not None else None,
+            float(msg.get("aheadSec", 0)),
+        )
     elif kind == "bounds":
         b = db.bounds(msg["camera"])
         await session._send_json({

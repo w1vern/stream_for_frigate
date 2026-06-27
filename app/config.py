@@ -35,13 +35,20 @@ class Settings:
     token_ttl: int
     ffmpeg: str
     ffprobe: str
-    # Pace archive output to this multiple of real-time (ffmpeg -readrate). Sending
-    # as fast as possible saturates a thin relay link and starves the upstream
-    # command channel, so seeks get ignored. ~1.5x builds a small buffer while
-    # leaving headroom; seek-to-first-frame is unaffected (the -ss seek is instant).
-    archive_readrate: float
-    # Flow-control: pause archive feeding when the client is buffered this far
-    # (seconds) ahead of its playhead; resume below the low watermark.
+    # Credit-based flow control: the server never has more than this many media
+    # bytes outstanding (sent but not yet acked as received by the client). This
+    # bounds the data in flight across the *whole* path — frp buffers, the WAN
+    # socket, the kernel — none of which we otherwise control. On a seek/switch
+    # only this much stale data has to drain before the new stream is visible, so
+    # it caps seek-to-first-frame latency (~WINDOW / link_rate). It must stay >=
+    # the bandwidth-delay product to keep throughput up: 256 KB sustains ~13 Mbps
+    # at 150 ms RTT, well above any single camera, while draining in ~1.7s @ 1.2
+    # Mbps. Applies to live and archive alike.
+    flow_window_bytes: int
+    # Soft prefetch cap (archive only): stop reading ahead once the client is this
+    # far (seconds) ahead of its playhead, so we don't buffer the whole archive
+    # into client RAM; resume below the low watermark. Over a thin link the client
+    # can't get this far ahead, so this never engages and feeding stays continuous.
     buffer_high: float
     buffer_low: float
 
@@ -79,7 +86,7 @@ def load_settings() -> Settings:
         token_ttl=int(_env("TOKEN_TTL", "86400")),
         ffmpeg=_env("FFMPEG", "ffmpeg"),
         ffprobe=_env("FFPROBE", "ffprobe"),
-        archive_readrate=float(_env("ARCHIVE_READRATE", "1.5")),
+        flow_window_bytes=int(_env("FLOW_WINDOW_BYTES", str(256 * 1024))),
         buffer_high=float(_env("BUFFER_HIGH", "20")),
         buffer_low=float(_env("BUFFER_LOW", "10")),
     )
