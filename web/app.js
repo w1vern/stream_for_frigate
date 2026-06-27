@@ -27,8 +27,13 @@ let streamStart = 0; // epoch of currentTime 0 (archive)
 let streamGen = 0;   // server stream generation; echoed in acks to drop stale ones
 let archiveBounds = null; // {start, end}
 let scrubbing = false;
-let lastScrubSent = 0;
-let pendingPreviewTime = 0;
+// Scrub previews are paced one-in-flight (request/response) instead of on a
+// fixed timer, so the rate adapts to RTT and never builds a backlog that would
+// delay the seek on release (which is what made scrubbing unusable over the
+// relay). `scrubPending` holds the latest position not yet requested.
+let scrubInFlight = false;
+let scrubPending = null;
+let scrubTimer = 0;
 
 // ---- Login ----------------------------------------------------------------
 $("login-form").addEventListener("submit", async (e) => {
@@ -326,6 +331,8 @@ timelineEl.addEventListener("pointermove", (ev) => {
 timelineEl.addEventListener("pointerup", (ev) => {
   if (!scrubbing) return;
   scrubbing = false;
+  scrubPending = null;
+  clearTimeout(scrubTimer);
   previewImg.classList.add("hidden");
   const t = pointerTime(ev);
   startArchive(t); // resume continuous stream from release point
@@ -335,22 +342,33 @@ function onScrubMove(ev) {
   const t = pointerTime(ev);
   playheadEl.style.left = `${timeToX(t)}px`;
   clockEl.textContent = fmtClock(t);
-  // Throttle scrub previews to ~10/s; keep at most one in flight conceptually.
-  const now = performance.now();
-  if (now - lastScrubSent > 90) {
-    lastScrubSent = now;
-    pendingPreviewTime = t;
-    send({ type: "scrub", camera, time: t });
-  }
+  scrubPending = t;
+  pumpScrub();
+}
+
+// Send the latest pending scrub position iff none is outstanding. A safety
+// timer clears the in-flight flag if a preview is ever dropped, so scrubbing
+// can't get wedged.
+function pumpScrub() {
+  if (!scrubbing || scrubInFlight || scrubPending == null) return;
+  const t = scrubPending;
+  scrubPending = null;
+  scrubInFlight = true;
+  send({ type: "scrub", camera, time: t });
+  clearTimeout(scrubTimer);
+  scrubTimer = setTimeout(() => { scrubInFlight = false; pumpScrub(); }, 700);
 }
 
 function showPreview(t, jpegBytes) {
-  // Ignore stale previews far from the latest requested position.
-  if (!scrubbing) return;
-  const blob = new Blob([jpegBytes], { type: "image/jpeg" });
-  const url = URL.createObjectURL(blob);
-  previewImg.onload = () => URL.revokeObjectURL(url);
-  previewImg.src = url;
+  scrubInFlight = false;
+  clearTimeout(scrubTimer);
+  if (scrubbing) {
+    const blob = new Blob([jpegBytes], { type: "image/jpeg" });
+    const url = URL.createObjectURL(blob);
+    previewImg.onload = () => URL.revokeObjectURL(url);
+    previewImg.src = url;
+  }
+  pumpScrub(); // fire the next pending position, if any
 }
 
 // ---- Periodic UI + flow control ------------------------------------------

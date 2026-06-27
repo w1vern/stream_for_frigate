@@ -45,6 +45,12 @@ class Session:
         # gen and are ignored, so a leftover "buffer full" ack can't pause the
         # freshly started one (the cause of the every-other-seek black screen).
         self._gen = 0
+        # Serializes ALL writes to the socket. The pump task (media) and the
+        # receive loop (scrub previews / json) would otherwise call send
+        # concurrently; `websockets` forbids overlapping drains and asserts,
+        # killing the connection — which is exactly what broke scrubbing once
+        # latency (the relay) made drains actually block.
+        self._send_lock = asyncio.Lock()
 
     # -- lifecycle ----------------------------------------------------------
     async def stop(self) -> None:
@@ -104,7 +110,7 @@ class Session:
                 if not chunk:
                     await self._send_json({"type": "ended"})
                     break
-                await self.ws.send_bytes(MEDIA + chunk)
+                await self._send_bytes(MEDIA + chunk)
         except (WebSocketDisconnect, RuntimeError, ConnectionError):
             pass
 
@@ -137,7 +143,7 @@ class Session:
                 if not chunk:
                     await self._send_json({"type": "ended"})
                     break
-                await self.ws.send_bytes(MEDIA + chunk)
+                await self._send_bytes(MEDIA + chunk)
         except (WebSocketDisconnect, RuntimeError, ConnectionError):
             pass
 
@@ -149,11 +155,17 @@ class Session:
         offset = max(0.0, t - seg.start)
         jpeg = await streamer.preview_jpeg(seg, offset)
         if jpeg and self.ws.application_state == WebSocketState.CONNECTED:
-            await self.ws.send_bytes(PREVIEW + struct.pack(">d", t) + jpeg)
+            await self._send_bytes(PREVIEW + struct.pack(">d", t) + jpeg)
+
+    async def _send_bytes(self, data: bytes) -> None:
+        if self.ws.application_state == WebSocketState.CONNECTED:
+            async with self._send_lock:
+                await self.ws.send_bytes(data)
 
     async def _send_json(self, obj: dict) -> None:
         if self.ws.application_state == WebSocketState.CONNECTED:
-            await self.ws.send_text(json.dumps(obj))
+            async with self._send_lock:
+                await self.ws.send_text(json.dumps(obj))
 
 
 async def handle(ws: WebSocket) -> None:
