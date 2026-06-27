@@ -103,6 +103,7 @@ class Session:
 
     async def _pump_archive(self) -> None:
         assert self._archive
+        header = MEDIA + struct.pack(">I", self._gen)
         try:
             while True:
                 await self._resume.wait()
@@ -110,7 +111,7 @@ class Session:
                 if not chunk:
                     await self._send_json({"type": "ended"})
                     break
-                await self._send_bytes(MEDIA + chunk)
+                await self._send_bytes(header + chunk)
         except (WebSocketDisconnect, RuntimeError, ConnectionError):
             pass
 
@@ -137,13 +138,14 @@ class Session:
 
     async def _pump_live(self) -> None:
         assert self._live
+        header = MEDIA + struct.pack(">I", self._gen)
         try:
             while True:
                 chunk = await self._live.read()
                 if not chunk:
                     await self._send_json({"type": "ended"})
                     break
-                await self._send_bytes(MEDIA + chunk)
+                await self._send_bytes(header + chunk)
         except (WebSocketDisconnect, RuntimeError, ConnectionError):
             pass
 

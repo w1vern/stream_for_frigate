@@ -137,7 +137,12 @@ function onBinary(bytes) {
   const type = bytes[0];
   const payload = bytes.subarray(1);
   if (type === 0x01) {
-    enqueueMedia(payload);
+    // [0x01][gen uint32][fMP4]. Drop media tagged with an old generation: after
+    // a seek, chunks of the previous stream are still in flight (especially over
+    // the relay) and would otherwise be appended to the new buffer, snapping
+    // playback to wherever the old stream was.
+    const gen = new DataView(bytes.buffer, bytes.byteOffset + 1, 4).getUint32(0, false);
+    if (gen === streamGen) enqueueMedia(payload.subarray(4));
   } else if (type === 0x02) {
     // 8-byte float64 (epoch) + JPEG
     const t = new DataView(bytes.buffer, bytes.byteOffset + 1, 8).getFloat64(0, false);
