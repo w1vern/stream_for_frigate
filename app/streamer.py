@@ -70,6 +70,22 @@ async def probe_codecs(path: str) -> list[str]:
     return candidates
 
 
+# A camera's encoder doesn't change at runtime, but ffprobe was ~70% of the
+# time-to-first-frame. Cache the result per camera for the process lifetime;
+# a streamer restart re-probes (e.g. if you ever switch a camera's codec).
+_codec_cache: dict[str, list[str]] = {}
+
+
+async def codecs_for(camera: str, sample_path: str) -> list[str]:
+    """Cached :func:`probe_codecs` keyed by camera."""
+    cached = _codec_cache.get(camera)
+    if cached is not None:
+        return cached
+    codecs = await probe_codecs(sample_path)
+    _codec_cache[camera] = codecs
+    return codecs
+
+
 class ArchiveProcess:
     """One ffmpeg concat run producing a continuous fMP4 byte stream from ``t``."""
 

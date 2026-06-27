@@ -80,7 +80,7 @@ class Session:
             return
         first = segments[0]
         offset = max(0.0, t - first.start)
-        codecs = await streamer.probe_codecs(first.path)
+        codecs = await streamer.codecs_for(camera, first.path)
         self._gen += 1
         self._ahead = 0.0
         self._resume.set()
@@ -117,7 +117,7 @@ class Session:
             return
         # Probe a recent recording for the codec string (same encoder as live).
         seg = db.segment_at(camera, db.bounds(camera)[1] - 1) if db.bounds(camera) else None
-        codecs = await streamer.probe_codecs(seg.path) if seg else ["avc1.640029", "avc1.4D0028"]
+        codecs = await streamer.codecs_for(camera, seg.path) if seg else ["avc1.640029", "avc1.4D0028"]
         self._gen += 1
         self._ahead = 0.0
         self._resume.set()
