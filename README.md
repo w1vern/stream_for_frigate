@@ -52,14 +52,27 @@ Server → client **binary** frames are tagged by a 1-byte prefix:
 
 ## Deploy (on the cottage PC, alongside Frigate)
 
-`compose.yml` here is a drop-in replacement for the Frigate stack's compose: it is
-the original Frigate services **unchanged** plus a `streamer` service for this app.
+The combined `compose.yml` (a drop-in replacement for Frigate's own compose: the
+original Frigate services **unchanged** plus the `streamer` service) lives in the
+Frigate folder; this repo is cloned next to it as a subfolder. Expected layout:
 
-1. Copy this repo onto the host next to Frigate's `./config` and the
-   `/mnt/data/frigate` recordings (or edit the volume paths in `compose.yml`).
-2. `cp .env.example .env` and fill in `SECRET_KEY` and the camera RTSP URLs.
+```
+frigate/                 # the existing Frigate folder
+  compose.yml            # combined Frigate + streamer compose
+  config/                # Frigate config + frigate.db (existing)
+  stream_for_frigate/     # ← this repo (git pull updates it)
+  .env                   # secrets (created in step 2)
+```
+
+1. In the Frigate folder, clone/pull this repo as `stream_for_frigate/`, and make
+   sure `compose.yml` there is the combined one (with the `streamer` service).
+2. `cp stream_for_frigate/.env.example .env` (in the Frigate folder, next to
+   `compose.yml`) and fill in `SECRET_KEY` and the camera RTSP URLs.
 3. `docker compose up -d --build`
 4. Open `http://<host>:5000`, log in with your Frigate username/password.
+
+> The `streamer` build context is the `stream_for_frigate/` subfolder. If you
+> rename the repo/folder, update `build:` in `compose.yml` to match.
 
 To expose it externally, point your existing frp/traefik relay at port `5000`
 (WebSocket upgrade must be allowed). Example `frpc` entry:
