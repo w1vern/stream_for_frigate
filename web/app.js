@@ -171,7 +171,7 @@ function setupMediaSource(msg) {
     try {
       sourceBuffer = mediaSource.addSourceBuffer(mime);
       sourceBuffer.mode = "segments";
-      sourceBuffer.addEventListener("updateend", drainQueue);
+      sourceBuffer.addEventListener("updateend", onUpdateEnd);
       drainQueue();
     } catch (e) {
       setStatus("⚠ ошибка SourceBuffer: " + e.message);
@@ -187,8 +187,25 @@ function enqueueMedia(payload) {
   drainQueue();
 }
 
+// True only while `sourceBuffer` is still attached to an open MediaSource.
+// After a stream switch (or a media error) the old SourceBuffer is detached and
+// touching .updating/.buffered throws — guard every access through this.
+function sbReady() {
+  return (
+    sourceBuffer &&
+    mediaSource &&
+    mediaSource.readyState === "open" &&
+    Array.prototype.indexOf.call(mediaSource.sourceBuffers, sourceBuffer) !== -1
+  );
+}
+
+function onUpdateEnd() {
+  drainQueue();
+  ensurePlaying();
+}
+
 function drainQueue() {
-  if (!sourceBuffer || sourceBuffer.updating || appendQueue.length === 0) return;
+  if (!sbReady() || sourceBuffer.updating || appendQueue.length === 0) return;
   const chunk = appendQueue[0];
   try {
     sourceBuffer.appendBuffer(chunk);
@@ -204,8 +221,25 @@ function drainQueue() {
   }
 }
 
+// Start/keep playback going. play() must happen AFTER media is appended (calling
+// it earlier, before the SourceBuffer has data, just rejects and never retries —
+// the classic "one frame then frozen" symptom). Also nudge currentTime back into
+// the buffered range if the playhead ever falls outside it.
+function ensurePlaying() {
+  let b;
+  try { b = video.buffered; } catch { return; }
+  if (!b || !b.length) return;
+  // Only nudge forward if the playhead is *behind* the buffer (startup, or after
+  // eviction trimmed the front). An underrun at the buffer's end is left alone —
+  // playback resumes by itself once more media is appended.
+  if (video.currentTime < b.start(0)) {
+    try { video.currentTime = b.start(0); } catch {}
+  }
+  if (video.paused) video.play().catch(() => {});
+}
+
 function evictBuffer() {
-  if (!sourceBuffer || sourceBuffer.updating) return;
+  if (!sbReady() || sourceBuffer.updating) return;
   const buffered = sourceBuffer.buffered;
   if (buffered.length && video.currentTime - buffered.start(0) > 30) {
     try { sourceBuffer.remove(buffered.start(0), video.currentTime - 20); } catch {}
@@ -224,8 +258,8 @@ function selectCamera(c) {
 function startLive() {
   mode = "live";
   setModeButtons();
+  // Playback is kicked off in ensurePlaying() once the first media is appended.
   send({ type: "live", camera });
-  video.play().catch(() => {});
 }
 
 function startArchive(t) {
@@ -234,7 +268,6 @@ function startArchive(t) {
   if (!archiveBounds) return;
   const target = clamp(t || archiveBounds.end - 30, archiveBounds.start, archiveBounds.end - 1);
   send({ type: "play", camera, time: target });
-  video.play().catch(() => {});
 }
 
 function setModeButtons() {
@@ -320,16 +353,19 @@ function showPreview(t, jpegBytes) {
 
 // ---- Periodic UI + flow control ------------------------------------------
 setInterval(() => {
-  drainQueue(); // recover if a prior append stalled (e.g. after eviction)
+  drainQueue();    // recover if a prior append stalled (e.g. after eviction)
+  ensurePlaying(); // recover if playback stalled / was never (re)started
   if (mode === "archive" && !scrubbing) {
     const t = currentEpoch();
     if (t != null) {
       playheadEl.style.left = `${timeToX(t)}px`;
       clockEl.textContent = fmtClock(t);
     }
-    // Flow control: tell the server how far we are buffered ahead.
-    if (sourceBuffer && sourceBuffer.buffered.length) {
-      const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+    // Flow control: tell the server how far we are buffered ahead. Read the
+    // element's buffered (always safe) rather than the SourceBuffer's (which
+    // throws once detached).
+    if (video.buffered.length) {
+      const end = video.buffered.end(video.buffered.length - 1);
       send({ type: "ack", aheadSec: Math.max(0, end - video.currentTime) });
     }
   } else if (mode === "live") {
