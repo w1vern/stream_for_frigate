@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Stream for Frigate</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <!-- Login -->
+  <div id="login" class="login">
+    <form id="login-form" class="login-card">
+      <h1>Stream for Frigate</h1>
+      <input id="username" type="text" placeholder="Пользователь" autocomplete="username" required />
+      <input id="password" type="password" placeholder="Пароль" autocomplete="current-password" required />
+      <button type="submit">Войти</button>
+      <div id="login-error" class="error"></div>
+    </form>
+  </div>
+
+  <!-- Player -->
+  <div id="app" class="app hidden">
+    <header class="topbar">
+      <div id="cameras" class="cameras"></div>
+      <div class="modes">
+        <button id="mode-live" class="mode">LIVE</button>
+        <button id="mode-archive" class="mode active">Архив</button>
+      </div>
+      <div id="status" class="status">—</div>
+    </header>
+
+    <div class="stage">
+      <video id="video" playsinline muted></video>
+      <img id="preview" class="preview hidden" alt="" />
+      <div id="badge" class="badge hidden">LIVE</div>
+    </div>
+
+    <div id="timeline-wrap" class="timeline-wrap">
+      <div class="clock"><span id="clock">—</span></div>
+      <div id="timeline" class="timeline">
+        <div id="playhead" class="playhead"></div>
+      </div>
+      <div class="range"><span id="range-start"></span><span id="range-end"></span></div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
