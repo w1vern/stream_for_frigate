@@ -24,6 +24,7 @@ let mediaSource = null;
 let sourceBuffer = null;
 const appendQueue = [];
 let streamStart = 0; // epoch of currentTime 0 (archive)
+let streamGen = 0;   // server stream generation; echoed in acks to drop stale ones
 let archiveBounds = null; // {start, end}
 let scrubbing = false;
 let lastScrubSent = 0;
@@ -162,6 +163,7 @@ function setupMediaSource(msg) {
   }
   mode = msg.mode;
   streamStart = msg.streamStart || 0;
+  streamGen = msg.gen || 0;
   badge.classList.toggle("hidden", mode !== "live");
 
   mediaSource = new MediaSource();
@@ -361,13 +363,15 @@ setInterval(() => {
       playheadEl.style.left = `${timeToX(t)}px`;
       clockEl.textContent = fmtClock(t);
     }
-    // Flow control: tell the server how far we are buffered ahead. Read the
-    // element's buffered (always safe) rather than the SourceBuffer's (which
-    // throws once detached).
-    if (video.buffered.length) {
-      const end = video.buffered.end(video.buffered.length - 1);
-      send({ type: "ack", aheadSec: Math.max(0, end - video.currentTime) });
-    }
+    // Flow control: tell the server how far we are buffered ahead. Send EVERY
+    // tick (even with an empty buffer -> aheadSec 0) so a freshly seeked stream
+    // always gets a resume signal; tag it with the stream gen so the server can
+    // drop acks left over from the previous stream. Read the element's buffered
+    // (always safe) rather than the SourceBuffer's (throws once detached).
+    const ahead = video.buffered.length
+      ? Math.max(0, video.buffered.end(video.buffered.length - 1) - video.currentTime)
+      : 0;
+    send({ type: "ack", gen: streamGen, aheadSec: ahead });
   } else if (mode === "live") {
     clockEl.textContent = fmtClock(Date.now() / 1000);
   }

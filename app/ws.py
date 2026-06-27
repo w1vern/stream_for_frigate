@@ -41,6 +41,10 @@ class Session:
         self._ahead = 0.0
         self._resume = asyncio.Event()
         self._resume.set()
+        # Bumped on every new stream; acks from an earlier stream carry a stale
+        # gen and are ignored, so a leftover "buffer full" ack can't pause the
+        # freshly started one (the cause of the every-other-seek black screen).
+        self._gen = 0
 
     # -- lifecycle ----------------------------------------------------------
     async def stop(self) -> None:
@@ -58,7 +62,9 @@ class Session:
             await self._live.stop()
             self._live = None
 
-    def set_ahead(self, seconds: float) -> None:
+    def set_ahead(self, seconds: float, gen: int) -> None:
+        if gen != self._gen:
+            return  # stale ack from a previous stream
         self._ahead = seconds
         if seconds <= settings.buffer_low:
             self._resume.set()
@@ -75,16 +81,18 @@ class Session:
         first = segments[0]
         offset = max(0.0, t - first.start)
         codecs = await streamer.probe_codecs(first.path)
+        self._gen += 1
+        self._ahead = 0.0
+        self._resume.set()
         # stream_start: epoch of the first frame the client will see. ffmpeg
         # seeks to the keyframe at/just before ``offset`` and rebases PTS to 0,
         # so currentTime 0 maps to roughly ``t`` (within one GOP).
         await self._send_json({
-            "type": "init", "mode": "archive", "camera": camera,
+            "type": "init", "mode": "archive", "camera": camera, "gen": self._gen,
             "codecs": codecs, "streamStart": first.start + offset,
         })
         self._archive = streamer.ArchiveProcess(segments, offset)
         await self._archive.start()
-        self._resume.set()
         self._task = asyncio.create_task(self._pump_archive())
 
     async def _pump_archive(self) -> None:
@@ -110,8 +118,12 @@ class Session:
         # Probe a recent recording for the codec string (same encoder as live).
         seg = db.segment_at(camera, db.bounds(camera)[1] - 1) if db.bounds(camera) else None
         codecs = await streamer.probe_codecs(seg.path) if seg else ["avc1.640029", "avc1.4D0028"]
+        self._gen += 1
+        self._ahead = 0.0
+        self._resume.set()
         await self._send_json({
-            "type": "init", "mode": "live", "camera": camera, "codecs": codecs,
+            "type": "init", "mode": "live", "camera": camera, "gen": self._gen,
+            "codecs": codecs,
         })
         self._live = streamer.LiveProcess(url)
         await self._live.start()
@@ -185,7 +197,7 @@ async def _dispatch(session: Session, msg: dict) -> None:
     elif kind == "scrub":
         await session.scrub(msg["camera"], float(msg["time"]))
     elif kind == "ack":
-        session.set_ahead(float(msg.get("aheadSec", 0)))
+        session.set_ahead(float(msg.get("aheadSec", 0)), int(msg.get("gen", -1)))
     elif kind == "bounds":
         b = db.bounds(msg["camera"])
         await session._send_json({
