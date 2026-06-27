@@ -13,4 +13,6 @@ COPY app ./app
 COPY web ./web
 
 EXPOSE 5000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "5000"]
+# Launched via main.py's __main__ so we can pass ws_ping_interval=None (disables
+# the keepalive ping that races media writes and kills the connection).
+CMD ["python", "-m", "app.main"]

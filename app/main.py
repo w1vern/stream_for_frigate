@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, Response, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -42,4 +42,27 @@ def index() -> FileResponse:
     return FileResponse(WEB_DIR / "index.html")
 
 
+@app.get("/favicon.ico")
+def favicon() -> Response:
+    return Response(status_code=204)
+
+
 app.mount("/", StaticFiles(directory=WEB_DIR), name="static")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    # ws_ping_interval=None disables the websockets library's built-in keepalive
+    # ping. That ping calls drain() on the socket on its own ~20s timer, racing
+    # our media writes -> websockets' _drain_helper asserts and kills the
+    # connection (every stream went dead ~20s in). We don't need protocol pings:
+    # media (live) and acks (archive) keep the socket live, and TCP/relay
+    # timeouts handle truly dead peers.
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=5000,
+        ws_ping_interval=None,
+        ws_ping_timeout=None,
+    )
