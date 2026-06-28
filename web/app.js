@@ -31,6 +31,15 @@ let streamGen = 0;   // server stream generation; echoed in acks to drop stale o
 let recvBytes = 0;
 let lastAckBytes = 0;
 const ACK_EVERY = 32 * 1024;
+
+// Playback management. LIVE trades a little latency for staying near the live
+// edge: if we drift too far behind (a stall accumulated lag) we skip forward;
+// small drift is absorbed by a gentle speed-up. ARCHIVE never skips real frames —
+// it just waits on a stall. Both jump across true holes (no data exists there).
+const LIVE_TARGET_LATENCY = 2.5; // seconds behind the live edge we aim to sit at
+const LIVE_MAX_LATENCY = 6.0;    // beyond this, hard-skip to the edge
+let recovering = false;          // re-initialising after a decode error
+let lastErrorAt = 0;
 let archiveBounds = null; // {start, end}
 let scrubbing = false;
 // Scrub previews are paced one-in-flight (request/response) instead of on a
@@ -71,6 +80,8 @@ function startApp() {
   appEl.classList.remove("hidden");
   buildCameraButtons();
   camera = cameras[0] || null;
+  // A decode failure fires 'error' on the element; rebuild instead of freezing.
+  video.addEventListener("error", () => recoverFromError());
   connect();
 }
 
@@ -189,6 +200,7 @@ function setupMediaSource(msg) {
   streamGen = msg.gen || 0;
   recvBytes = 0;
   lastAckBytes = 0;
+  try { video.playbackRate = 1; } catch {}
   badge.classList.toggle("hidden", mode !== "live");
 
   mediaSource = new MediaSource();
@@ -228,7 +240,7 @@ function sbReady() {
 
 function onUpdateEnd() {
   drainQueue();
-  ensurePlaying();
+  managePlayback();
 }
 
 function drainQueue() {
@@ -241,6 +253,10 @@ function drainQueue() {
     if (e.name === "QuotaExceededError") {
       // Drop the oldest buffered video; eviction fires updateend -> retry.
       evictBuffer();
+    } else if (video.error) {
+      // The media element decoder has failed; every further append throws. Don't
+      // limp on dropping chunks (that was the permanent-freeze symptom) — rebuild.
+      recoverFromError();
     } else {
       appendQueue.shift();
       setStatus("⚠ append: " + e.message);
@@ -248,21 +264,72 @@ function drainQueue() {
   }
 }
 
-// Start/keep playback going. play() must happen AFTER media is appended (calling
-// it earlier, before the SourceBuffer has data, just rejects and never retries —
-// the classic "one frame then frozen" symptom). Also nudge currentTime back into
-// the buffered range if the playhead ever falls outside it.
-function ensurePlaying() {
+function inBuffered(b, t) {
+  for (let i = 0; i < b.length; i++) {
+    if (t >= b.start(i) - 0.05 && t < b.end(i)) return true;
+  }
+  return false;
+}
+
+function nextRangeStart(b, t) {
+  for (let i = 0; i < b.length; i++) {
+    if (b.start(i) > t) return b.start(i);
+  }
+  return null;
+}
+
+// The playback manager: keep video playing, mode-appropriately. Runs both on
+// `updateend` (right after new media lands) and on the periodic tick.
+//   - currentTime behind the buffer (startup / front eviction): jump in.
+//   - playhead in a true hole (no data exists there): skip to next data. This is
+//     not dropping frames — there are none here (a recording gap, or a live drop).
+//   - LIVE only: hold ~LIVE_TARGET_LATENCY behind the edge — hard-skip if too far
+//     back, gently speed up on mild drift. ARCHIVE plays strictly 1x and waits.
+function managePlayback() {
+  if (recovering || scrubbing || !sbReady()) return;
+  if (video.error) { recoverFromError(); return; }
   let b;
   try { b = video.buffered; } catch { return; }
-  if (!b || !b.length) return;
-  // Only nudge forward if the playhead is *behind* the buffer (startup, or after
-  // eviction trimmed the front). An underrun at the buffer's end is left alone —
-  // playback resumes by itself once more media is appended.
+  if (!b.length) return;
+  const end = b.end(b.length - 1);
+
   if (video.currentTime < b.start(0)) {
     try { video.currentTime = b.start(0); } catch {}
+  } else if (!inBuffered(b, video.currentTime)) {
+    const nxt = nextRangeStart(b, video.currentTime);
+    if (nxt != null) { try { video.currentTime = nxt; } catch {} }
   }
+
+  if (mode === "live") {
+    const latency = end - video.currentTime;
+    if (latency > LIVE_MAX_LATENCY) {
+      try { video.currentTime = end - LIVE_TARGET_LATENCY; } catch {}
+      video.playbackRate = 1;
+    } else if (latency > LIVE_TARGET_LATENCY + 1.0) {
+      video.playbackRate = 1.05; // catch up smoothly, no visible jump
+    } else if (video.playbackRate !== 1) {
+      video.playbackRate = 1;
+    }
+  }
+
   if (video.paused) video.play().catch(() => {});
+}
+
+// Decode error -> rebuild the pipeline and resume: live jumps back to the edge,
+// archive resumes from where it died. A short backoff avoids a tight crash loop.
+function recoverFromError() {
+  if (recovering) return;
+  recovering = true;
+  const now = Date.now();
+  const wait = now - lastErrorAt < 3000 ? 1500 : 300;
+  lastErrorAt = now;
+  setStatus("⟳ восстановление…");
+  const resumeEpoch = mode === "archive" ? currentEpoch() : null;
+  setTimeout(() => {
+    recovering = false;
+    if (mode === "live") startLive();
+    else if (resumeEpoch != null) startArchive(resumeEpoch);
+  }, wait);
 }
 
 function evictBuffer() {
@@ -285,7 +352,7 @@ function selectCamera(c) {
 function startLive() {
   mode = "live";
   setModeButtons();
-  // Playback is kicked off in ensurePlaying() once the first media is appended.
+  // Playback is kicked off in managePlayback() once the first media is appended.
   send({ type: "live", camera });
 }
 
@@ -409,9 +476,10 @@ function sendAck() {
 }
 
 // ---- Periodic UI + flow control ------------------------------------------
+// 250 ms so live-edge management reacts quickly without being jittery.
 setInterval(() => {
-  drainQueue();    // recover if a prior append stalled (e.g. after eviction)
-  ensurePlaying(); // recover if playback stalled / was never (re)started
+  drainQueue();      // recover if a prior append stalled (e.g. after eviction)
+  managePlayback();  // keep playing; live-edge / gap / rate management
   if (mode === "archive" && !scrubbing) {
     const t = currentEpoch();
     if (t != null) {
@@ -422,7 +490,7 @@ setInterval(() => {
     clockEl.textContent = fmtClock(Date.now() / 1000);
   }
   if (!scrubbing) sendAck(); // heartbeat (both modes)
-}, 500);
+}, 250);
 
 function renderRange() {
   if (!archiveBounds) return;

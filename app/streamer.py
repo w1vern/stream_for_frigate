@@ -145,7 +145,11 @@ class LiveProcess:
             "-rtsp_transport", "tcp", "-fflags", "nobuffer", "-flags", "low_delay",
             "-i", self._url,
             "-an", "-c:v", "copy",
-            "-movflags", _FMP4, "-frag_duration", "200000",
+            # Fragment ONLY at keyframes (no -frag_duration): every fragment then
+            # starts with an IDR and is independently decodable, so the client can
+            # skip to the live edge cleanly. Mid-GOP fragments caused the "half
+            # frame / one person becomes two" decode artifacts after a skip/drop.
+            "-movflags", _FMP4,
             "-f", "mp4", "pipe:1",
         )
 
