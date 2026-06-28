@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from fastapi import FastAPI, Response, WebSocket
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from . import ws as ws_module
@@ -14,6 +14,26 @@ from .auth import authenticate, issue_token
 from .db import list_cameras
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+
+# Content-hash of the frontend assets, used both as a cache-busting query (so a
+# redeploy forces browsers to fetch the new files without a manual cache clear)
+# and as the human-visible version label. Computed once at startup — the files
+# don't change inside the running container.
+def _asset_version() -> str:
+    h = hashlib.sha1()
+    for name in ("app.js", "style.css", "index.html"):
+        try:
+            h.update((WEB_DIR / name).read_bytes())
+        except FileNotFoundError:
+            pass
+    return h.hexdigest()[:8]
+
+
+ASSET_VER = _asset_version()
+# index.html carries `__VER__` placeholders (asset query strings + a global the
+# client reads for its version label); substitute them once.
+_INDEX_HTML = (WEB_DIR / "index.html").read_text(encoding="utf-8").replace("__VER__", ASSET_VER)
+_LONG_CACHE = {"Cache-Control": "public, max-age=31536000, immutable"}
 
 app = FastAPI(title="Stream for Frigate")
 
@@ -38,16 +58,24 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
 
 @app.get("/")
-def index() -> FileResponse:
-    return FileResponse(WEB_DIR / "index.html")
+def index() -> HTMLResponse:
+    # Always fresh so the cache-busting asset versions are never stale.
+    return HTMLResponse(_INDEX_HTML, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/app.js")
+def app_js() -> FileResponse:
+    return FileResponse(WEB_DIR / "app.js", media_type="text/javascript", headers=_LONG_CACHE)
+
+
+@app.get("/style.css")
+def style_css() -> FileResponse:
+    return FileResponse(WEB_DIR / "style.css", media_type="text/css", headers=_LONG_CACHE)
 
 
 @app.get("/favicon.ico")
 def favicon() -> Response:
     return Response(status_code=204)
-
-
-app.mount("/", StaticFiles(directory=WEB_DIR), name="static")
 
 
 if __name__ == "__main__":

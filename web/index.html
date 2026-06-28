@@ -4,7 +4,8 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Stream for Frigate</title>
-  <link rel="stylesheet" href="/style.css" />
+  <link rel="stylesheet" href="/style.css?v=__VER__" />
+  <script>window.__VER__ = "__VER__";</script>
 </head>
 <body>
   <!-- Login -->
@@ -33,6 +34,15 @@
       <video id="video" playsinline muted></video>
       <img id="preview" class="preview hidden" alt="" />
       <div id="badge" class="badge hidden">LIVE</div>
+      <div id="debug" class="debug"></div>
+      <button id="fs-btn" class="fs-btn" title="На весь экран">⤢</button>
+    </div>
+
+    <!-- Archive transport controls (hidden in live) -->
+    <div id="controls" class="controls">
+      <button id="seek-back" class="ctrl" title="Назад 10 с">⟲ 10</button>
+      <button id="play-pause" class="ctrl ctrl-main" title="Пауза/Воспроизведение">⏸</button>
+      <button id="seek-fwd" class="ctrl" title="Вперёд 10 с">10 ⟳</button>
     </div>
 
     <div id="timeline-wrap" class="timeline-wrap">
@@ -44,6 +54,8 @@
     </div>
   </div>
 
-  <script src="/app.js"></script>
+  <div id="version" class="version"></div>
+
+  <script src="/app.js?v=__VER__"></script>
 </body>
 </html>

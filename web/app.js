@@ -12,6 +12,11 @@ const clockEl = $("clock");
 const camerasEl = $("cameras");
 const timelineEl = $("timeline");
 const playheadEl = $("playhead");
+const debugEl = $("debug");
+
+// Version label (content-hash injected by the server) — lets the user confirm a
+// browser cache refresh actually took.
+$("version").textContent = "v" + (window.__VER__ || "dev");
 
 // ---- State ----------------------------------------------------------------
 let ws = null;
@@ -40,6 +45,7 @@ const LIVE_TARGET_LATENCY = 2.5; // seconds behind the live edge we aim to sit a
 const LIVE_MAX_LATENCY = 6.0;    // beyond this, hard-skip to the edge
 let recovering = false;          // re-initialising after a decode error
 let lastErrorAt = 0;
+let userPaused = false;          // archive: user hit pause; don't auto-resume
 let archiveBounds = null; // {start, end}
 let scrubbing = false;
 // Scrub previews are paced one-in-flight (request/response) instead of on a
@@ -200,6 +206,8 @@ function setupMediaSource(msg) {
   streamGen = msg.gen || 0;
   recvBytes = 0;
   lastAckBytes = 0;
+  userPaused = false;
+  updatePlayPauseBtn();
   try { video.playbackRate = 1; } catch {}
   badge.classList.toggle("hidden", mode !== "live");
 
@@ -312,7 +320,7 @@ function managePlayback() {
     }
   }
 
-  if (video.paused) video.play().catch(() => {});
+  if (!userPaused && video.paused) video.play().catch(() => {});
 }
 
 // Decode error -> rebuild the pipeline and resume: live jumps back to the edge,
@@ -368,12 +376,65 @@ function setModeButtons() {
   $("mode-live").classList.toggle("active", mode === "live");
   $("mode-archive").classList.toggle("active", mode === "archive");
   badge.classList.toggle("hidden", mode !== "live");
+  appEl.classList.toggle("live", mode === "live"); // hides archive chrome via CSS
 }
 
 $("mode-live").addEventListener("click", startLive);
 $("mode-archive").addEventListener("click", () =>
   startArchive(archiveBounds ? archiveBounds.end - 30 : 0)
 );
+
+// ---- Transport controls (archive) + fullscreen ---------------------------
+function updatePlayPauseBtn() {
+  const btn = $("play-pause");
+  if (btn) btn.textContent = userPaused ? "▶" : "⏸";
+}
+
+function togglePlay() {
+  userPaused = !userPaused;
+  if (userPaused) video.pause();
+  else video.play().catch(() => {});
+  updatePlayPauseBtn();
+}
+
+// Jump by `delta` seconds. Stays local (instant) if the target is already
+// buffered; otherwise re-requests the stream from the server at that time.
+function seekRelative(delta) {
+  if (mode !== "archive" || !archiveBounds) return;
+  const cur = currentEpoch();
+  if (cur == null) return;
+  const target = clamp(cur + delta, archiveBounds.start, archiveBounds.end - 1);
+  const localT = target - streamStart;
+  let buffered = false;
+  try {
+    const b = video.buffered;
+    for (let i = 0; i < b.length; i++) {
+      if (localT >= b.start(i) && localT < b.end(i)) { buffered = true; break; }
+    }
+  } catch {}
+  if (buffered) {
+    userPaused = false;
+    updatePlayPauseBtn();
+    video.currentTime = localT;
+    video.play().catch(() => {});
+  } else {
+    startArchive(target);
+  }
+}
+
+$("play-pause").addEventListener("click", togglePlay);
+$("seek-back").addEventListener("click", () => seekRelative(-10));
+$("seek-fwd").addEventListener("click", () => seekRelative(10));
+
+function toggleFullscreen() {
+  const el = appEl;
+  if (!document.fullscreenElement) {
+    (el.requestFullscreen || el.webkitRequestFullscreen || (() => {})).call(el);
+  } else {
+    document.exitFullscreen();
+  }
+}
+$("fs-btn").addEventListener("click", toggleFullscreen);
 
 function requestBounds() {
   send({ type: "bounds", camera });
@@ -475,6 +536,21 @@ function sendAck() {
   lastAckBytes = recvBytes;
 }
 
+// Compact debug readout (mode/gen, buffer ahead, playback rate, throughput).
+function updateDebug() {
+  if (!sbReady()) { debugEl.textContent = ""; return; }
+  let ahead = 0, ranges = 0;
+  try {
+    const b = video.buffered;
+    ranges = b.length;
+    if (b.length) ahead = b.end(b.length - 1) - video.currentTime;
+  } catch {}
+  const label = mode === "live" ? `lag≈${ahead.toFixed(1)}s` : `buf ${ahead.toFixed(1)}s`;
+  debugEl.textContent =
+    `${mode} · gen ${streamGen} · ${label}\n` +
+    `ranges ${ranges} · ${video.playbackRate.toFixed(2)}x · ${(recvBytes / 1048576).toFixed(1)}MB`;
+}
+
 // ---- Periodic UI + flow control ------------------------------------------
 // 250 ms so live-edge management reacts quickly without being jittery.
 setInterval(() => {
@@ -489,6 +565,7 @@ setInterval(() => {
   } else if (mode === "live") {
     clockEl.textContent = fmtClock(Date.now() / 1000);
   }
+  updateDebug();
   if (!scrubbing) sendAck(); // heartbeat (both modes)
 }, 250);
 
