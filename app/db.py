@@ -81,6 +81,35 @@ def segment_at(camera: str, t: float) -> Segment | None:
     return _seg(row) if row else None
 
 
+def availability(
+    camera: str, start: float, end: float, merge_gap: float = 5.0
+) -> list[list[float]]:
+    """Merged [start, end] intervals where recording exists within [start, end].
+
+    Consecutive segments (and tiny inter-segment gaps <= ``merge_gap``) collapse
+    into one interval; the gaps that remain are genuine "no recording" spans, used
+    to shade the timeline. Returned intervals are clipped to the query window.
+    """
+    with _open() as conn:
+        rows = conn.execute(
+            "SELECT start_time, end_time FROM recordings "
+            "WHERE camera = ? AND end_time >= ? AND start_time <= ? "
+            "ORDER BY start_time ASC",
+            (camera, start, end),
+        ).fetchall()
+    intervals: list[list[float]] = []
+    for row in rows:
+        s = max(start, float(row["start_time"]))
+        e = min(end, float(row["end_time"]))
+        if e <= s:
+            continue
+        if intervals and s - intervals[-1][1] <= merge_gap:
+            intervals[-1][1] = max(intervals[-1][1], e)
+        else:
+            intervals.append([s, e])
+    return intervals
+
+
 def contiguous_from(
     camera: str, t: float, max_duration: float = 6 * 3600
 ) -> list[Segment]:

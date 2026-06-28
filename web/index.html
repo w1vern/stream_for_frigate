@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Stream for Frigate</title>
   <link rel="stylesheet" href="/style.css?v=__VER__" />
-  <script>window.__VER__ = "__VER__";</script>
 </head>
 <body>
   <!-- Login -->
@@ -27,6 +26,7 @@
         <button id="mode-live" class="mode">LIVE</button>
         <button id="mode-archive" class="mode active">Архив</button>
       </div>
+      <div id="debug" class="debug"></div>
       <div id="status" class="status">—</div>
     </header>
 
@@ -34,7 +34,6 @@
       <video id="video" playsinline muted></video>
       <img id="preview" class="preview hidden" alt="" />
       <div id="badge" class="badge hidden">LIVE</div>
-      <div id="debug" class="debug"></div>
       <button id="fs-btn" class="fs-btn" title="На весь экран">⤢</button>
     </div>
 
@@ -46,11 +45,18 @@
     </div>
 
     <div id="timeline-wrap" class="timeline-wrap">
-      <div class="clock"><span id="clock">—</span></div>
-      <div id="timeline" class="timeline">
-        <div id="playhead" class="playhead"></div>
+      <div class="daynav">
+        <button id="day-prev" class="daybtn" title="Предыдущий день">◀</button>
+        <span id="day-label" class="day-label">—</span>
+        <button id="day-next" class="daybtn" title="Следующий день">▶</button>
+        <span id="clock" class="clock">—</span>
       </div>
-      <div class="range"><span id="range-start"></span><span id="range-end"></span></div>
+      <div id="timeline" class="timeline">
+        <div id="avail" class="avail"></div>
+        <div id="future" class="future hidden"></div>
+        <div id="playhead" class="playhead hidden"></div>
+      </div>
+      <div class="range"><span id="range-start">00:00</span><span id="range-end">24:00</span></div>
     </div>
   </div>
 

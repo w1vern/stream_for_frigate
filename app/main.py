@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from fastapi import FastAPI, Response, WebSocket
+from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -57,10 +57,23 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     await ws_module.handle(websocket)
 
 
+_INDEX_ETAG = f'"{ASSET_VER}"'
+# Cache the HTML for instant repeat loads, but keep it self-invalidating:
+#  - max-age=0 + ETag: the browser may reuse the cached copy but revalidates;
+#    when unchanged the server returns a tiny 304 (no body) -> ~1 RTT, no re-parse.
+#  - stale-while-revalidate: serve the cached copy INSTANTLY and refresh in the
+#    background, so a redeploy is picked up on the next load without ever blocking
+#    first paint. Assets are content-hashed + immutable, so a new HTML pulls new
+#    JS/CSS automatically. Net: opening the site is as fast as the cache allows
+#    yet a deploy still propagates on its own.
+_INDEX_CACHE = "max-age=0, stale-while-revalidate=604800"
+
+
 @app.get("/")
-def index() -> HTMLResponse:
-    # Always fresh so the cache-busting asset versions are never stale.
-    return HTMLResponse(_INDEX_HTML, headers={"Cache-Control": "no-store"})
+def index(request: Request) -> Response:
+    if request.headers.get("if-none-match") == _INDEX_ETAG:
+        return Response(status_code=304, headers={"ETag": _INDEX_ETAG, "Cache-Control": _INDEX_CACHE})
+    return HTMLResponse(_INDEX_HTML, headers={"ETag": _INDEX_ETAG, "Cache-Control": _INDEX_CACHE})
 
 
 @app.get("/app.js")

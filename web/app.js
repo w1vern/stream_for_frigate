@@ -14,9 +14,11 @@ const timelineEl = $("timeline");
 const playheadEl = $("playhead");
 const debugEl = $("debug");
 
-// Version label (content-hash injected by the server) — lets the user confirm a
-// browser cache refresh actually took.
-$("version").textContent = "v" + (window.__VER__ || "dev");
+// Bump this by hand on meaningful frontend changes. Shown in the corner so a
+// stale browser cache is obvious at a glance. (Asset cache-busting is automatic
+// via the server's content-hash; this is just the human-readable marker.)
+const APP_VERSION = "0.2.0";
+$("version").textContent = "v" + APP_VERSION;
 
 // ---- State ----------------------------------------------------------------
 let ws = null;
@@ -30,6 +32,15 @@ let sourceBuffer = null;
 const appendQueue = [];
 let streamStart = 0; // epoch of currentTime 0 (archive)
 let streamGen = 0;   // server stream generation; echoed in acks to drop stale ones
+
+// Day-based archive timeline: the bar always spans exactly one local day, so a
+// fixed pixel step is always a fixed time jump. `dayStart`/`dayEnd` are the epoch
+// bounds of the selected day; `availIntervals` are the recorded spans within it.
+const DAY = 86400;
+let dayStart = 0;
+let dayEnd = 0;
+let availIntervals = [];
+let availKey = "";   // camera|dayStart of the in-flight availability request
 // Credit-window flow control: count media bytes received for the current stream
 // and ack them back so the server keeps only a bounded amount in flight. Reset on
 // every new stream (init). `lastAckBytes` throttles how often we ack.
@@ -144,7 +155,14 @@ function onControl(msg) {
     case "bounds":
       if (msg.camera === camera && msg.start != null) {
         archiveBounds = { start: msg.start, end: msg.end };
-        renderRange();
+        updateDayNav();
+      }
+      break;
+    case "availability":
+      if (msg.camera === camera && `${msg.camera}|${dayStart}` === availKey &&
+          msg.from === dayStart) {
+        availIntervals = msg.intervals || [];
+        renderAvailability();
       }
       break;
     case "ended":
@@ -354,7 +372,10 @@ function selectCamera(c) {
   markActiveCamera();
   requestBounds();
   if (mode === "live") startLive();
-  else startArchive(currentEpoch() || (archiveBounds && archiveBounds.end - 5));
+  else {
+    startArchive(currentEpoch() || (archiveBounds && archiveBounds.end - 5));
+    requestAvailability(); // same day, new camera -> refresh the shading
+  }
 }
 
 function startLive() {
@@ -369,6 +390,7 @@ function startArchive(t) {
   setModeButtons();
   if (!archiveBounds) return;
   const target = clamp(t || archiveBounds.end - 30, archiveBounds.start, archiveBounds.end - 1);
+  setDay(target); // bring the timeline to the day we're about to play
   send({ type: "play", camera, time: target });
 }
 
@@ -440,23 +462,113 @@ function requestBounds() {
   send({ type: "bounds", camera });
 }
 
-// ---- Timeline + scrubbing -------------------------------------------------
+// ---- Timeline (one day) + scrubbing --------------------------------------
 function currentEpoch() {
   if (mode !== "archive" || !streamStart) return null;
   return streamStart + video.currentTime;
 }
 
+function dayStartOf(epoch) {
+  const d = new Date(epoch * 1000);
+  d.setHours(0, 0, 0, 0);
+  return Math.floor(d.getTime() / 1000);
+}
+
+function addDays(dayStartEpoch, n) {
+  const d = new Date(dayStartEpoch * 1000);
+  d.setDate(d.getDate() + n);
+  d.setHours(0, 0, 0, 0);
+  return Math.floor(d.getTime() / 1000);
+}
+
+function maxDay() {
+  // Latest navigable day: today, or the last day with data if that's later.
+  const last = archiveBounds ? Math.max(archiveBounds.end, Date.now() / 1000) : Date.now() / 1000;
+  return dayStartOf(last);
+}
+
+const daySpan = () => Math.max(1, dayEnd - dayStart); // ~86400 (handles odd days)
+
+// Switch the visible day (any epoch within it). Clamps to [first data day, today].
+function setDay(epoch) {
+  let ds = dayStartOf(epoch);
+  if (archiveBounds) ds = clamp(ds, dayStartOf(archiveBounds.start), maxDay());
+  if (ds === dayStart) return;
+  dayStart = ds;
+  dayEnd = addDays(ds, 1);
+  availIntervals = [];
+  renderAvailability();
+  updateDayNav();
+  requestAvailability();
+}
+
+function requestAvailability() {
+  if (!camera || !dayStart) return;
+  availKey = `${camera}|${dayStart}`;
+  send({ type: "availability", camera, from: dayStart, to: dayEnd });
+}
+
+function updateDayNav() {
+  $("day-label").textContent = dayStart ? fmtDate(dayStart) : "—";
+  if (archiveBounds) {
+    $("day-prev").disabled = dayStart <= dayStartOf(archiveBounds.start);
+    $("day-next").disabled = dayStart >= maxDay();
+  }
+}
+
+function renderAvailability() {
+  const host = $("avail");
+  host.innerHTML = "";
+  if (!dayStart) return;
+  const w = timelineEl.clientWidth || 1;
+  for (const [s, e] of availIntervals) {
+    const x0 = clamp((s - dayStart) / daySpan(), 0, 1) * w;
+    const x1 = clamp((e - dayStart) / daySpan(), 0, 1) * w;
+    const seg = document.createElement("div");
+    seg.className = "seg";
+    seg.style.left = `${x0}px`;
+    seg.style.width = `${Math.max(1, x1 - x0)}px`;
+    host.appendChild(seg);
+  }
+  renderFuture();
+}
+
+function renderFuture() {
+  const fut = $("future");
+  const now = Date.now() / 1000;
+  if (now <= dayStart) { // whole day still in the future
+    fut.style.left = "0";
+    fut.classList.remove("hidden");
+  } else if (now < dayEnd) {
+    fut.style.left = `${((now - dayStart) / daySpan()) * (timelineEl.clientWidth || 1)}px`;
+    fut.classList.remove("hidden");
+  } else {
+    fut.classList.add("hidden");
+  }
+}
+
+// Nearest recorded time to `t` within the day, so a click on an empty span still
+// plays something sensible. null if the day has no recording at all.
+function snapToAvailable(t) {
+  if (!availIntervals.length) return null;
+  for (const [s, e] of availIntervals) if (t >= s && t < e) return t;
+  let best = null, bestDist = Infinity;
+  for (const [s, e] of availIntervals) {
+    for (const edge of [s, e - 1]) {
+      const d = Math.abs(edge - t);
+      if (d < bestDist) { bestDist = d; best = edge; }
+    }
+  }
+  return best;
+}
+
 function timeToX(t) {
-  if (!archiveBounds) return 0;
-  const { start, end } = archiveBounds;
-  return ((t - start) / (end - start)) * timelineEl.clientWidth;
+  return ((t - dayStart) / daySpan()) * timelineEl.clientWidth;
 }
 
 function xToTime(x) {
-  if (!archiveBounds) return 0;
-  const { start, end } = archiveBounds;
   const frac = clamp(x / timelineEl.clientWidth, 0, 1);
-  return start + frac * (end - start);
+  return dayStart + frac * daySpan();
 }
 
 function pointerTime(ev) {
@@ -465,7 +577,7 @@ function pointerTime(ev) {
 }
 
 timelineEl.addEventListener("pointerdown", (ev) => {
-  if (!archiveBounds) return;
+  if (!dayStart) return;
   scrubbing = true;
   timelineEl.setPointerCapture(ev.pointerId);
   previewImg.classList.remove("hidden");
@@ -482,12 +594,18 @@ timelineEl.addEventListener("pointerup", (ev) => {
   scrubPending = null;
   clearTimeout(scrubTimer);
   previewImg.classList.add("hidden");
-  const t = pointerTime(ev);
-  startArchive(t); // resume continuous stream from release point
+  const t = snapToAvailable(pointerTime(ev));
+  if (t != null) startArchive(t); // resume continuous stream from release point
+  else setStatus("нет записи в этот момент");
 });
+
+$("day-prev").addEventListener("click", () => { if (dayStart) setDay(addDays(dayStart, -1)); });
+$("day-next").addEventListener("click", () => { if (dayStart) setDay(addDays(dayStart, 1)); });
+addEventListener("resize", renderAvailability);
 
 function onScrubMove(ev) {
   const t = pointerTime(ev);
+  playheadEl.classList.remove("hidden");
   playheadEl.style.left = `${timeToX(t)}px`;
   clockEl.textContent = fmtClock(t);
   scrubPending = t;
@@ -559,8 +677,11 @@ setInterval(() => {
   if (mode === "archive" && !scrubbing) {
     const t = currentEpoch();
     if (t != null) {
+      if (t < dayStart || t >= dayEnd) setDay(t); // follow playback across midnight
+      playheadEl.classList.remove("hidden");
       playheadEl.style.left = `${timeToX(t)}px`;
       clockEl.textContent = fmtClock(t);
+      renderFuture(); // keep the "now" marker advancing
     }
   } else if (mode === "live") {
     clockEl.textContent = fmtClock(Date.now() / 1000);
@@ -568,12 +689,6 @@ setInterval(() => {
   updateDebug();
   if (!scrubbing) sendAck(); // heartbeat (both modes)
 }, 250);
-
-function renderRange() {
-  if (!archiveBounds) return;
-  $("range-start").textContent = fmtClock(archiveBounds.start);
-  $("range-end").textContent = fmtClock(archiveBounds.end);
-}
 
 // ---- Helpers --------------------------------------------------------------
 function setStatus(s) { statusEl.textContent = s; }
@@ -583,5 +698,12 @@ function fmtClock(epoch) {
   // epoch is UTC seconds; Date renders in the viewer's local timezone.
   const d = new Date(epoch * 1000);
   const p = (n) => String(n).padStart(2, "0");
-  return `${p(d.getDate())}.${p(d.getMonth() + 1)} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function fmtDate(epoch) {
+  const d = new Date(epoch * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  const wd = ["вс", "пн", "вт", "ср", "чт", "пт", "сб"][d.getDay()];
+  return `${wd} ${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()}`;
 }

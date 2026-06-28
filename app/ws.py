@@ -300,5 +300,12 @@ async def _dispatch(session: Session, msg: dict) -> None:
             "type": "bounds", "camera": msg["camera"],
             "start": b[0] if b else None, "end": b[1] if b else None,
         })
+    elif kind == "availability":
+        frm, to = float(msg["from"]), float(msg["to"])
+        await session._send_json({
+            "type": "availability", "camera": msg["camera"],
+            "from": frm, "to": to,
+            "intervals": db.availability(msg["camera"], frm, to),
+        })
     elif kind == "stop":
         await session.stop()
