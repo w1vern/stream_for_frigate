@@ -17,8 +17,15 @@ const debugEl = $("debug");
 // Bump this by hand on meaningful frontend changes. Shown in the corner so a
 // stale browser cache is obvious at a glance. (Asset cache-busting is automatic
 // via the server's content-hash; this is just the human-readable marker.)
-const APP_VERSION = "0.2.0";
+const APP_VERSION = "0.3.1";
 $("version").textContent = "v" + APP_VERSION;
+
+// Wall-clock timezone the archive UI renders in. Recordings are stored as UTC
+// epochs; the server (running on the cottage PC) reports the offset that is
+// cottage-local time, so day boundaries and the clock reflect what actually
+// happened at the cottage regardless of the viewer's own timezone. Set from the
+// login response / ws `ready`; 0 until then. See tzWall()/dayStartOf().
+let tzOffsetSec = 0;
 
 // ---- State ----------------------------------------------------------------
 let ws = null;
@@ -86,6 +93,7 @@ $("login-form").addEventListener("submit", async (e) => {
     const data = await res.json();
     token = data.token;
     cameras = data.cameras || [];
+    if (data.tzOffsetMinutes != null) tzOffsetSec = data.tzOffsetMinutes * 60;
     startApp();
   } catch {
     $("login-error").textContent = "Ошибка соединения";
@@ -143,6 +151,7 @@ function onControl(msg) {
   switch (msg.type) {
     case "ready":
       cameras = msg.cameras || cameras;
+      if (msg.tzOffsetMinutes != null) tzOffsetSec = msg.tzOffsetMinutes * 60;
       buildCameraButtons();
       if (!camera) camera = cameras[0];
       markActiveCamera();
@@ -445,8 +454,22 @@ function seekRelative(delta) {
 }
 
 $("play-pause").addEventListener("click", togglePlay);
-$("seek-back").addEventListener("click", () => seekRelative(-10));
-$("seek-fwd").addEventListener("click", () => seekRelative(10));
+// One handler for every interval button; the jump size lives in data-seek.
+document.querySelectorAll(".seek").forEach((b) =>
+  b.addEventListener("click", () => seekRelative(Number(b.dataset.seek)))
+);
+
+// Keyboard transport (archive): ←/→ jump 10 s, Shift+←/→ jump 1 min, Space
+// toggles play. Ignored while typing in a field (the timelapse form).
+addEventListener("keydown", (e) => {
+  const el = document.activeElement;
+  if (el && (el.tagName === "INPUT" || el.tagName === "SELECT" || el.tagName === "TEXTAREA")) return;
+  if (!$("tl-modal").classList.contains("hidden")) return; // modal open
+  if (mode !== "archive") return;
+  if (e.key === "ArrowLeft") { seekRelative(e.shiftKey ? -60 : -10); e.preventDefault(); }
+  else if (e.key === "ArrowRight") { seekRelative(e.shiftKey ? 60 : 10); e.preventDefault(); }
+  else if (e.key === " ") { togglePlay(); e.preventDefault(); }
+});
 
 function toggleFullscreen() {
   const el = appEl;
@@ -468,17 +491,21 @@ function currentEpoch() {
   return streamStart + video.currentTime;
 }
 
+// A Date shifted into cottage-local time; read it via its getUTC* accessors to
+// get cottage wall-clock fields regardless of the viewer's own timezone.
+function tzWall(epoch) {
+  return new Date((epoch + tzOffsetSec) * 1000);
+}
+
+// Epoch of cottage-local midnight for the day containing `epoch`. The offset is
+// fixed (cottage TZ has no DST), so day math is exact arithmetic.
 function dayStartOf(epoch) {
-  const d = new Date(epoch * 1000);
-  d.setHours(0, 0, 0, 0);
-  return Math.floor(d.getTime() / 1000);
+  const shifted = epoch + tzOffsetSec;
+  return Math.floor(shifted / DAY) * DAY - tzOffsetSec;
 }
 
 function addDays(dayStartEpoch, n) {
-  const d = new Date(dayStartEpoch * 1000);
-  d.setDate(d.getDate() + n);
-  d.setHours(0, 0, 0, 0);
-  return Math.floor(d.getTime() / 1000);
+  return dayStartEpoch + n * DAY;
 }
 
 function maxDay() {
@@ -599,8 +626,18 @@ timelineEl.addEventListener("pointerup", (ev) => {
   else setStatus("нет записи в этот момент");
 });
 
-$("day-prev").addEventListener("click", () => { if (dayStart) setDay(addDays(dayStart, -1)); });
-$("day-next").addEventListener("click", () => { if (dayStart) setDay(addDays(dayStart, 1)); });
+// Day arrows jump PLAYBACK to the start of the adjacent day (the server snaps to
+// that day's first recording). They used to only move the timeline's viewed day,
+// which the 250 ms follow-tick immediately snapped back to the still-playing day
+// — so day navigation looked dead. Seeking playback makes the follow-tick agree.
+function goDay(delta) {
+  if (!dayStart || !archiveBounds) return;
+  const target = addDays(dayStart, delta);
+  if (target < dayStartOf(archiveBounds.start) || target > maxDay()) return;
+  startArchive(target); // seeks to day start; server lands on first recording
+}
+$("day-prev").addEventListener("click", () => goDay(-1));
+$("day-next").addEventListener("click", () => goDay(1));
 addEventListener("resize", renderAvailability);
 
 function onScrubMove(ev) {
@@ -690,20 +727,139 @@ setInterval(() => {
   if (!scrubbing) sendAck(); // heartbeat (both modes)
 }, 250);
 
+// ---- Timelapse ("ускоренный обзор") ---------------------------------------
+// A datetime-local field shows/edits COTTAGE wall-clock time (to match the rest
+// of the UI), so convert against tzOffsetSec rather than the browser's own zone.
+function epochToInput(epoch) {
+  const d = tzWall(epoch);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}` +
+         `T${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
+function inputToEpoch(str) {
+  const m = (str || "").match(/^(\d+)-(\d+)-(\d+)T(\d+):(\d+)(?::(\d+))?$/);
+  if (!m) return null;
+  const n = m.map(Number);
+  const utc = Date.UTC(n[1], n[2] - 1, n[3], n[4], n[5], n[6] || 0) / 1000;
+  return utc - tzOffsetSec; // wall time was cottage-local
+}
+
+function tlEndDefault() {
+  const now = Math.floor(Date.now() / 1000);
+  if (mode === "archive") return currentEpoch() || now;
+  return archiveBounds ? Math.min(now, archiveBounds.end) : now;
+}
+
+function openTimelapse() {
+  const end = tlEndDefault();
+  $("tl-end").value = epochToInput(end);
+  $("tl-start").value = epochToInput(end - 12 * 3600);
+  resetTlPlayer();
+  $("tl-status").textContent = "";
+  $("tl-modal").classList.remove("hidden");
+}
+
+function tlSetRange(hours) {
+  const end = tlEndDefault();
+  $("tl-end").value = epochToInput(end);
+  $("tl-start").value = epochToInput(end - hours * 3600);
+}
+
+function tlUrl(dl) {
+  const start = inputToEpoch($("tl-start").value);
+  const end = inputToEpoch($("tl-end").value);
+  if (start == null || end == null || end <= start) return null;
+  const p = new URLSearchParams({
+    token, camera, start: String(start), end: String(end),
+    speed: $("tl-speed").value,
+    mode: $("tl-smooth").checked ? "smooth" : "keyframe",
+  });
+  if (dl) p.set("dl", "1");
+  return "/api/timelapse?" + p.toString();
+}
+
+function resetTlPlayer() {
+  const v = $("tl-video");
+  try { v.pause(); } catch {}
+  if (v.src) {
+    try { URL.revokeObjectURL(v.src); } catch {}
+    v.removeAttribute("src");
+    v.load();
+  }
+  $("tl-modal").querySelector(".tl-player").classList.add("hidden");
+}
+
+function closeTimelapse() {
+  resetTlPlayer();
+  $("tl-modal").classList.add("hidden");
+}
+
+// View = the same one-shot bulk GET as download, buffered fully to a Blob then
+// played. No interactive HTTP streaming (which stalled over the relay — the whole
+// reason live/archive use the WebSocket); the file is small by design.
+async function tlView() {
+  const url = tlUrl(false);
+  if (!url) { $("tl-status").textContent = "Проверьте диапазон (конец должен быть позже начала)"; return; }
+  $("tl-status").textContent = "Готовим обзор…";
+  $("tl-view").disabled = $("tl-download").disabled = true;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) {
+      let m = res.status;
+      try { m = (await res.json()).error || m; } catch {}
+      $("tl-status").textContent = "Ошибка: " + m;
+      return;
+    }
+    const blob = await res.blob();
+    const v = $("tl-video");
+    if (v.src) { try { URL.revokeObjectURL(v.src); } catch {} }
+    v.src = URL.createObjectURL(blob);
+    $("tl-modal").querySelector(".tl-player").classList.remove("hidden");
+    $("tl-status").textContent = `Готово · ${(blob.size / 1048576).toFixed(1)} МБ`;
+    v.play().catch(() => {});
+  } catch {
+    $("tl-status").textContent = "Ошибка загрузки";
+  } finally {
+    $("tl-view").disabled = $("tl-download").disabled = false;
+  }
+}
+
+function tlDownload() {
+  const url = tlUrl(true);
+  if (!url) { $("tl-status").textContent = "Проверьте диапазон (конец должен быть позже начала)"; return; }
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  $("tl-status").textContent = "Скачивание запущено…";
+}
+
+$("tl-open").addEventListener("click", openTimelapse);
+$("tl-close").addEventListener("click", closeTimelapse);
+$("tl-view").addEventListener("click", tlView);
+$("tl-download").addEventListener("click", tlDownload);
+$("tl-modal").addEventListener("click", (e) => { if (e.target === $("tl-modal")) closeTimelapse(); });
+document.querySelectorAll(".tl-q").forEach((b) =>
+  b.addEventListener("click", () => tlSetRange(Number(b.dataset.hours)))
+);
+
 // ---- Helpers --------------------------------------------------------------
 function setStatus(s) { statusEl.textContent = s; }
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
 function fmtClock(epoch) {
-  // epoch is UTC seconds; Date renders in the viewer's local timezone.
-  const d = new Date(epoch * 1000);
+  // Rendered in cottage-local time (tzWall + UTC accessors), not the viewer's.
+  const d = tzWall(epoch);
   const p = (n) => String(n).padStart(2, "0");
-  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  return `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
 }
 
 function fmtDate(epoch) {
-  const d = new Date(epoch * 1000);
+  const d = tzWall(epoch);
   const p = (n) => String(n).padStart(2, "0");
-  const wd = ["вс", "пн", "вт", "ср", "чт", "пт", "сб"][d.getDay()];
-  return `${wd} ${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()}`;
+  const wd = ["вс", "пн", "вт", "ср", "чт", "пт", "сб"][d.getUTCDay()];
+  return `${wd} ${p(d.getUTCDate())}.${p(d.getUTCMonth() + 1)}.${d.getUTCFullYear()}`;
 }

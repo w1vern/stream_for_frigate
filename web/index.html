@@ -25,6 +25,7 @@
       <div class="modes">
         <button id="mode-live" class="mode">LIVE</button>
         <button id="mode-archive" class="mode active">Архив</button>
+        <button id="tl-open" class="mode mode-tl" title="Ускоренный обзор интервала">⏩ Обзор</button>
       </div>
       <div id="debug" class="debug"></div>
       <div id="status" class="status">—</div>
@@ -39,9 +40,15 @@
 
     <!-- Archive transport controls (hidden in live) -->
     <div id="controls" class="controls">
-      <button id="seek-back" class="ctrl" title="Назад 10 с">⟲ 10</button>
-      <button id="play-pause" class="ctrl ctrl-main" title="Пауза/Воспроизведение">⏸</button>
-      <button id="seek-fwd" class="ctrl" title="Вперёд 10 с">10 ⟳</button>
+      <button class="ctrl seek" data-seek="-3600" title="Назад 1 час">«1ч</button>
+      <button class="ctrl seek" data-seek="-600" title="Назад 10 минут">«10м</button>
+      <button class="ctrl seek" data-seek="-60" title="Назад 1 минуту">«1м</button>
+      <button class="ctrl seek" data-seek="-10" title="Назад 10 секунд (←)">‹10с</button>
+      <button id="play-pause" class="ctrl ctrl-main" title="Пауза/Воспроизведение (Пробел)">⏸</button>
+      <button class="ctrl seek" data-seek="10" title="Вперёд 10 секунд (→)">10с›</button>
+      <button class="ctrl seek" data-seek="60" title="Вперёд 1 минуту">1м»</button>
+      <button class="ctrl seek" data-seek="600" title="Вперёд 10 минут">10м»</button>
+      <button class="ctrl seek" data-seek="3600" title="Вперёд 1 час">1ч»</button>
     </div>
 
     <div id="timeline-wrap" class="timeline-wrap">
@@ -57,6 +64,50 @@
         <div id="playhead" class="playhead hidden"></div>
       </div>
       <div class="range"><span id="range-start">00:00</span><span id="range-end">24:00</span></div>
+    </div>
+  </div>
+
+  <!-- Timelapse ("ускоренный обзор") modal -->
+  <div id="tl-modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <span>Ускоренный обзор</span>
+        <button id="tl-close" class="modal-x" title="Закрыть">✕</button>
+      </div>
+      <div class="tl-form">
+        <label>Начало<input id="tl-start" type="datetime-local" step="1" /></label>
+        <label>Конец<input id="tl-end" type="datetime-local" step="1" /></label>
+        <div class="tl-row">
+          <label class="tl-speed">Ускорение
+            <select id="tl-speed">
+              <option value="30">30×</option>
+              <option value="60">60×</option>
+              <option value="120" selected>120×</option>
+              <option value="240">240×</option>
+              <option value="480">480×</option>
+              <option value="960">960×</option>
+              <option value="1440">1440×</option>
+            </select>
+          </label>
+          <label class="tl-smooth"><input id="tl-smooth" type="checkbox" /> плавно (медленнее)</label>
+        </div>
+        <div class="tl-quick">
+          <span>Быстро:</span>
+          <button class="tl-q" data-hours="1">1ч</button>
+          <button class="tl-q" data-hours="3">3ч</button>
+          <button class="tl-q" data-hours="6">6ч</button>
+          <button class="tl-q" data-hours="12">12ч</button>
+          <button class="tl-q" data-hours="24">24ч</button>
+        </div>
+        <div class="tl-actions">
+          <button id="tl-view" class="tl-btn tl-primary">▶ Смотреть</button>
+          <button id="tl-download" class="tl-btn">⬇ Скачать</button>
+        </div>
+        <div id="tl-status" class="tl-status"></div>
+      </div>
+      <div class="tl-player hidden">
+        <video id="tl-video" controls playsinline></video>
+      </div>
     </div>
   </div>
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import time
 from dataclasses import dataclass
 
 
@@ -51,6 +52,19 @@ class Settings:
     # can't get this far ahead, so this never engages and feeding stays continuous.
     buffer_high: float
     buffer_low: float
+    # Wall-clock timezone the UI renders archive times in. The server runs on the
+    # cottage PC, so its own local UTC offset *is* cottage time — that's the
+    # default. Set DISPLAY_TZ_OFFSET (minutes east of UTC, e.g. 180 for MSK) to
+    # override when the container's clock isn't on cottage-local time. ``None``
+    # means "use the process's local offset". See ``tz_offset_minutes``.
+    display_tz_offset: int | None
+    # Ceiling on a single timelapse request's source span (hours), so one export
+    # can't pin ffmpeg on the whole archive.
+    timelapse_max_hours: float
+    # Assumed keyframe spacing (seconds) of the recordings. Used to turn a
+    # requested speed-up into an output frame rate for the cheap keyframe-only
+    # timelapse (out_fps = speed / this). Frigate GOP is ~4 s. See streamer.
+    timelapse_keyframe_interval: float
 
     def remap_path(self, db_path: str) -> str:
         if self.db_media_prefix and db_path.startswith(self.db_media_prefix):
@@ -89,7 +103,27 @@ def load_settings() -> Settings:
         flow_window_bytes=int(_env("FLOW_WINDOW_BYTES", str(256 * 1024))),
         buffer_high=float(_env("BUFFER_HIGH", "20")),
         buffer_low=float(_env("BUFFER_LOW", "10")),
+        display_tz_offset=(
+            int(os.environ["DISPLAY_TZ_OFFSET"])
+            if os.environ.get("DISPLAY_TZ_OFFSET", "").strip()
+            else None
+        ),
+        timelapse_max_hours=float(_env("TIMELAPSE_MAX_HOURS", "48")),
+        timelapse_keyframe_interval=float(_env("TIMELAPSE_KEYFRAME_INTERVAL", "4")),
     )
 
 
 settings = load_settings()
+
+
+def tz_offset_minutes() -> int:
+    """Minutes east of UTC that the UI should render archive wall-clock times in.
+
+    Configured override wins; otherwise the process's current local offset (which,
+    on the cottage PC, is cottage time). Resolved per-call so a DST change is
+    picked up without a restart (the cottage TZ has no DST, but this stays correct
+    if the deployment ever moves)."""
+    if settings.display_tz_offset is not None:
+        return settings.display_tz_offset
+    off = time.localtime().tm_gmtoff
+    return off // 60 if off is not None else 0

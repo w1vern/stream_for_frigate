@@ -166,6 +166,104 @@ class LiveProcess:
             await self._proc.wait()
 
 
+class TimelapseProcess:
+    """One ffmpeg run producing a sped-up fMP4 overview of a time range.
+
+    Two methods, both re-encoding to H.264 (this is the one place we transcode):
+
+    * **keyframe** (default, cheap): ``-skip_frame nokey`` tells the decoder to
+      emit only keyframes, so ffmpeg decodes ~1 frame per GOP (~4 s of footage)
+      instead of every frame. Those keyframes are re-timed to ``out_fps`` and
+      encoded, giving a slideshow-like overview at ~``speed``x for a fraction of
+      the CPU of a full decode. To reach speeds beyond what the keyframe density
+      allows at a sane frame rate, keyframes are additionally *decimated* — only
+      every ``stride``-th kept — so any speed is reachable (see :meth:`_plan`).
+    * **smooth** (opt-in, expensive): full decode + ``setpts=PTS/speed`` for fluid
+      motion. Fine for short ranges; heavy for many hours on the cottage CPU.
+    """
+
+    # Playback rate the keyframe overview aims for. Keyframe decimation keeps the
+    # output near this rate instead of running the frame rate up to its ceiling as
+    # the requested speed climbs.
+    _TARGET_FPS = 24.0
+
+    def __init__(
+        self, segments: list[Segment], offset: float, duration: float,
+        speed: float, smooth: bool,
+    ):
+        self._segments = segments
+        self._offset = max(0.0, offset)
+        self._duration = max(0.0, duration)
+        self._speed = max(1.0, speed)
+        self._smooth = smooth
+        self._proc: asyncio.subprocess.Process | None = None
+        self._listfile: str | None = None
+
+    def _plan(self) -> tuple[int, float]:
+        """Return ``(keyframe stride, output fps)`` for the requested speed.
+
+        In keyframe mode each *kept* keyframe spans ``interval * stride`` seconds of
+        footage and is shown for ``1 / fps`` of playback, so the effective speed is
+        ``interval * stride * fps``. We first pick a stride that lands the frame
+        rate near ``_TARGET_FPS`` (so high speeds decimate keyframes rather than
+        pushing fps past a sane ceiling), then set fps to hit the requested speed.
+        Smooth mode keeps every frame (stride 1) at a steady 25 fps and does the
+        time compression with ``setpts`` instead."""
+        if self._smooth:
+            return 1, 25.0
+        interval = max(0.5, settings.timelapse_keyframe_interval)
+        stride = max(1, round(self._speed / (interval * self._TARGET_FPS)))
+        fps = self._speed / (interval * stride)
+        return stride, min(30.0, max(1.0, fps))
+
+    async def start(self) -> None:
+        fd, self._listfile = tempfile.mkstemp(suffix=".txt", prefix="sff_tl_")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            for seg in self._segments:
+                safe = seg.path.replace("'", "'\\''")
+                fh.write(f"file '{safe}'\n")
+        stride, fps = self._plan()
+        fps_s = f"{fps:.4f}"
+        pre_input: list[str] = ["-ss", f"{self._offset:.3f}"]
+        if self._duration > 0:
+            pre_input += ["-t", f"{self._duration:.3f}"]
+        if self._smooth:
+            # Full decode; compress time via PTS. Output at a steady 25 fps.
+            vf = f"setpts=PTS/{self._speed:.4f}"
+        else:
+            # Decode only keyframes; optionally keep every stride-th one; then
+            # re-stamp the survivors onto a constant fps grid (N = running index).
+            # The comma inside mod() is protected by the single quotes around the
+            # select expression, so no filtergraph escaping is needed.
+            pre_input = ["-skip_frame", "nokey"] + pre_input
+            sel = "" if stride <= 1 else f"select='not(mod(n,{stride}))',"
+            vf = f"{sel}setpts=N/{fps_s}/TB"
+        self._proc = await _run(
+            settings.ffmpeg, "-hide_banner", "-loglevel", "error",
+            *pre_input,
+            "-f", "concat", "-safe", "0", "-i", self._listfile,
+            "-an", "-vf", vf, "-r", fps_s, "-fps_mode", "cfr",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+            "-pix_fmt", "yuv420p",
+            "-movflags", _FMP4, "-frag_duration", "500000",
+            "-f", "mp4", "pipe:1",
+        )
+
+    async def read(self, n: int = 65536) -> bytes:
+        assert self._proc and self._proc.stdout
+        return await self._proc.stdout.read(n)
+
+    async def stop(self) -> None:
+        if self._proc and self._proc.returncode is None:
+            try:
+                self._proc.kill()
+            except ProcessLookupError:
+                pass
+            await self._proc.wait()
+        if self._listfile and os.path.exists(self._listfile):
+            os.unlink(self._listfile)
+
+
 async def preview_jpeg(segment: Segment, offset: float, width: int = 480) -> bytes:
     """Decode a single keyframe near ``offset`` into a small JPEG (scrub thumb)."""
     proc = await asyncio.create_subprocess_exec(

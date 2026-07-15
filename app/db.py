@@ -110,6 +110,22 @@ def availability(
     return intervals
 
 
+def segments_between(camera: str, start: float, end: float) -> list[Segment]:
+    """All segments overlapping ``[start, end]``, in order — the source footage
+    for a timelapse export. Unlike :func:`contiguous_from` it does NOT stop at
+    gaps: a timelapse simply skips over spans with no recording."""
+    if end <= start:
+        return []
+    with _open() as conn:
+        rows = conn.execute(
+            "SELECT path, start_time, end_time, duration FROM recordings "
+            "WHERE camera = ? AND end_time > ? AND start_time < ? "
+            "ORDER BY start_time ASC LIMIT 20000",
+            (camera, start, end),
+        ).fetchall()
+    return [_seg(row) for row in rows]
+
+
 def contiguous_from(
     camera: str, t: float, max_duration: float = 6 * 3600
 ) -> list[Segment]:

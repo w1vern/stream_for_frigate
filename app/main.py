@@ -5,12 +5,16 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from fastapi import FastAPI, Request, Response, WebSocket
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi import FastAPI, Query, Request, Response, WebSocket
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from . import db
+
+from . import streamer
 from . import ws as ws_module
-from .auth import authenticate, issue_token
+from .auth import authenticate, issue_token, verify_token
+from .config import settings, tz_offset_minutes
 from .db import list_cameras
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -49,12 +53,68 @@ def login(body: LoginBody) -> JSONResponse:
     if role is None:
         return JSONResponse({"error": "invalid credentials"}, status_code=401)
     token = issue_token(body.username, role)
-    return JSONResponse({"token": token, "role": role, "cameras": list_cameras()})
+    return JSONResponse({
+        "token": token, "role": role, "cameras": list_cameras(),
+        "tzOffsetMinutes": tz_offset_minutes(),
+    })
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await ws_module.handle(websocket)
+
+
+@app.get("/api/timelapse")
+async def timelapse(
+    token: str = Query(...),
+    camera: str = Query(...),
+    start: float = Query(...),
+    end: float = Query(...),
+    speed: float = Query(60.0),
+    mode: str = Query("keyframe"),
+    dl: int = Query(0),
+) -> Response:
+    """Sped-up overview of ``[start, end]`` as a small fragmented MP4.
+
+    Deliberately a plain one-shot bulk GET (not the media WebSocket): the output
+    is a single small, already-compressed artifact with no interactive seeking,
+    so the WS flow-control machinery buys nothing here. High relay latency only
+    adds one RTT of startup — it can't stall the transfer the way interactive
+    HTTP streaming did (which is why the live/archive path uses the WS). Auth via
+    the same session token, passed in the query so a bare ``<a download>`` /
+    ``fetch`` works without custom headers."""
+    if verify_token(token) is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if end <= start:
+        return JSONResponse({"error": "empty range"}, status_code=400)
+    max_span = settings.timelapse_max_hours * 3600
+    if end - start > max_span:
+        start = end - max_span  # clamp to the most recent max_span of the range
+    segments = db.segments_between(camera, start, end)
+    if not segments:
+        return JSONResponse({"error": "no recording in range"}, status_code=404)
+
+    offset = max(0.0, start - segments[0].start)
+    proc = streamer.TimelapseProcess(
+        segments, offset, end - start, speed, smooth=(mode == "smooth"),
+    )
+    await proc.start()
+
+    async def body():
+        try:
+            while True:
+                chunk = await proc.read()
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            await proc.stop()
+
+    headers = {"Cache-Control": "no-store"}
+    if dl:
+        fname = f"timelapse_{camera}_{int(start)}-{int(end)}_{int(speed)}x.mp4"
+        headers["Content-Disposition"] = f'attachment; filename="{fname}"'
+    return StreamingResponse(body(), media_type="video/mp4", headers=headers)
 
 
 _INDEX_ETAG = f'"{ASSET_VER}"'

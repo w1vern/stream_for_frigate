@@ -28,7 +28,7 @@ from starlette.websockets import WebSocketState
 
 from . import db, streamer
 from .auth import verify_token
-from .config import settings
+from .config import settings, tz_offset_minutes
 
 MEDIA = b"\x01"
 PREVIEW = b"\x02"
@@ -262,7 +262,10 @@ async def handle(ws: WebSocket) -> None:
         await ws.close(code=1008)
         return
 
-    await ws.send_text(json.dumps({"type": "ready", "cameras": db.list_cameras()}))
+    await ws.send_text(json.dumps({
+        "type": "ready", "cameras": db.list_cameras(),
+        "tzOffsetMinutes": tz_offset_minutes(),
+    }))
     session.start_writer()
 
     try:
