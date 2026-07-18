@@ -17,7 +17,7 @@ const debugEl = $("debug");
 // Bump this by hand on meaningful frontend changes. Shown in the corner so a
 // stale browser cache is obvious at a glance. (Asset cache-busting is automatic
 // via the server's content-hash; this is just the human-readable marker.)
-const APP_VERSION = "0.3.1";
+const APP_VERSION = "0.3.2";
 $("version").textContent = "v" + APP_VERSION;
 
 // Wall-clock timezone the archive UI renders in. Recordings are stored as UTC
@@ -734,7 +734,7 @@ function epochToInput(epoch) {
   const d = tzWall(epoch);
   const p = (n) => String(n).padStart(2, "0");
   return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}` +
-         `T${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+         `T${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
 }
 
 function inputToEpoch(str) {
@@ -751,28 +751,60 @@ function tlEndDefault() {
   return archiveBounds ? Math.min(now, archiveBounds.end) : now;
 }
 
+// The form is anchor+duration, not two absolute datetimes: you set an END
+// (default = now / current playhead) and how far to go BACK from it. That maps
+// straight onto "review the last N hours" without hand-computing a start stamp.
+function tlDurationSec() {
+  const n = parseFloat($("tl-dur").value);
+  const unit = parseFloat($("tl-dur-unit").value) || 3600;
+  return n > 0 ? n * unit : 0;
+}
+
+function tlSpeed() {
+  const s = parseFloat($("tl-speed").value);
+  if (!(s >= 2)) return null;
+  return Math.min(3000, s);
+}
+
+function tlRange() {
+  const end = inputToEpoch($("tl-end").value);
+  const dur = tlDurationSec();
+  if (end == null || dur <= 0) return null;
+  return { start: end - dur, end, dur };
+}
+
 function openTimelapse() {
-  const end = tlEndDefault();
-  $("tl-end").value = epochToInput(end);
-  $("tl-start").value = epochToInput(end - 12 * 3600);
+  $("tl-end").value = epochToInput(tlEndDefault());
+  if (!($("tl-dur").value > 0)) $("tl-dur").value = "12";
   resetTlPlayer();
   $("tl-status").textContent = "";
+  tlRefresh();
   $("tl-modal").classList.remove("hidden");
 }
 
-function tlSetRange(hours) {
-  const end = tlEndDefault();
-  $("tl-end").value = epochToInput(end);
-  $("tl-start").value = epochToInput(end - hours * 3600);
+// Live preview of what will be produced: the exact range, and — importantly for
+// the limited cottage uplink — a rough length of the resulting clip.
+function tlRefresh() {
+  const r = tlRange();
+  const sp = tlSpeed();
+  const ok = !!r && sp != null;
+  $("tl-view").disabled = $("tl-download").disabled = !ok;
+  if (!ok) {
+    $("tl-summary").textContent = "Укажите конец, длительность и ускорение (≥ 2×)";
+    return;
+  }
+  $("tl-summary").innerHTML =
+    `${fmtStamp(r.start)} → ${fmtStamp(r.end)} · окно ${fmtDur(r.dur)}` +
+    `<br>ролик ≈ ${fmtDur(r.dur / sp)} при ${sp}×`;
 }
 
 function tlUrl(dl) {
-  const start = inputToEpoch($("tl-start").value);
-  const end = inputToEpoch($("tl-end").value);
-  if (start == null || end == null || end <= start) return null;
+  const r = tlRange();
+  const sp = tlSpeed();
+  if (!r || sp == null) return null;
   const p = new URLSearchParams({
-    token, camera, start: String(start), end: String(end),
-    speed: $("tl-speed").value,
+    token, camera, start: String(r.start), end: String(r.end),
+    speed: String(sp),
     mode: $("tl-smooth").checked ? "smooth" : "keyframe",
   });
   if (dl) p.set("dl", "1");
@@ -800,7 +832,7 @@ function closeTimelapse() {
 // reason live/archive use the WebSocket); the file is small by design.
 async function tlView() {
   const url = tlUrl(false);
-  if (!url) { $("tl-status").textContent = "Проверьте диапазон (конец должен быть позже начала)"; return; }
+  if (!url) { $("tl-status").textContent = "Проверьте параметры интервала"; return; }
   $("tl-status").textContent = "Готовим обзор…";
   $("tl-view").disabled = $("tl-download").disabled = true;
   try {
@@ -821,13 +853,13 @@ async function tlView() {
   } catch {
     $("tl-status").textContent = "Ошибка загрузки";
   } finally {
-    $("tl-view").disabled = $("tl-download").disabled = false;
+    tlRefresh(); // re-enable buttons iff params are still valid
   }
 }
 
 function tlDownload() {
   const url = tlUrl(true);
-  if (!url) { $("tl-status").textContent = "Проверьте диапазон (конец должен быть позже начала)"; return; }
+  if (!url) { $("tl-status").textContent = "Проверьте параметры интервала"; return; }
   const a = document.createElement("a");
   a.href = url;
   a.download = "";
@@ -842,8 +874,19 @@ $("tl-close").addEventListener("click", closeTimelapse);
 $("tl-view").addEventListener("click", tlView);
 $("tl-download").addEventListener("click", tlDownload);
 $("tl-modal").addEventListener("click", (e) => { if (e.target === $("tl-modal")) closeTimelapse(); });
+$("tl-now").addEventListener("click", () => { $("tl-end").value = epochToInput(tlEndDefault()); tlRefresh(); });
+["tl-end", "tl-dur", "tl-dur-unit", "tl-speed", "tl-smooth"].forEach((id) =>
+  $(id).addEventListener("input", tlRefresh)
+);
 document.querySelectorAll(".tl-q").forEach((b) =>
-  b.addEventListener("click", () => tlSetRange(Number(b.dataset.hours)))
+  b.addEventListener("click", () => {
+    $("tl-dur").value = b.dataset.h;
+    $("tl-dur-unit").value = "3600";
+    tlRefresh();
+  })
+);
+document.querySelectorAll(".tl-s").forEach((b) =>
+  b.addEventListener("click", () => { $("tl-speed").value = b.dataset.s; tlRefresh(); })
 );
 
 // ---- Helpers --------------------------------------------------------------
@@ -862,4 +905,22 @@ function fmtDate(epoch) {
   const p = (n) => String(n).padStart(2, "0");
   const wd = ["вс", "пн", "вт", "ср", "чт", "пт", "сб"][d.getUTCDay()];
   return `${wd} ${p(d.getUTCDate())}.${p(d.getUTCMonth() + 1)}.${d.getUTCFullYear()}`;
+}
+
+// Compact "DD.MM HH:MM" cottage-local stamp for the timelapse summary line.
+function fmtStamp(epoch) {
+  const d = tzWall(epoch);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getUTCDate())}.${p(d.getUTCMonth() + 1)} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+}
+
+// Human duration ("2 ч 5 мин", "6 мин", "40 с") for window/estimated-clip length.
+function fmtDur(sec) {
+  sec = Math.max(0, Math.round(sec));
+  if (sec < 60) return `${sec} с`;
+  const m = Math.floor(sec / 60);
+  if (m < 60) { const s = sec % 60; return s ? `${m} мин ${s} с` : `${m} мин`; }
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return rm ? `${h} ч ${rm} мин` : `${h} ч`;
 }

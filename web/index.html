@@ -75,30 +75,42 @@
         <button id="tl-close" class="modal-x" title="Закрыть">✕</button>
       </div>
       <div class="tl-form">
-        <label>Начало<input id="tl-start" type="datetime-local" step="1" /></label>
-        <label>Конец<input id="tl-end" type="datetime-local" step="1" /></label>
-        <div class="tl-row">
-          <label class="tl-speed">Ускорение
-            <select id="tl-speed">
-              <option value="30">30×</option>
-              <option value="60">60×</option>
-              <option value="120" selected>120×</option>
-              <option value="240">240×</option>
-              <option value="480">480×</option>
-              <option value="960">960×</option>
-              <option value="1440">1440×</option>
+        <label class="tl-field">Конец интервала
+          <div class="tl-end-row">
+            <input id="tl-end" type="datetime-local" step="60" />
+            <button id="tl-now" type="button" class="tl-mini" title="Подставить текущий момент">Сейчас</button>
+          </div>
+        </label>
+        <label class="tl-field">Длительность (назад от конца)
+          <div class="tl-dur-row">
+            <input id="tl-dur" type="number" min="1" step="1" value="12" inputmode="numeric" />
+            <select id="tl-dur-unit">
+              <option value="60">минут</option>
+              <option value="3600" selected>часов</option>
             </select>
-          </label>
-          <label class="tl-smooth"><input id="tl-smooth" type="checkbox" /> плавно (медленнее)</label>
-        </div>
-        <div class="tl-quick">
-          <span>Быстро:</span>
-          <button class="tl-q" data-hours="1">1ч</button>
-          <button class="tl-q" data-hours="3">3ч</button>
-          <button class="tl-q" data-hours="6">6ч</button>
-          <button class="tl-q" data-hours="12">12ч</button>
-          <button class="tl-q" data-hours="24">24ч</button>
-        </div>
+          </div>
+          <div class="tl-dur-quick">
+            <button class="tl-q" type="button" data-h="1">1ч</button>
+            <button class="tl-q" type="button" data-h="3">3ч</button>
+            <button class="tl-q" type="button" data-h="6">6ч</button>
+            <button class="tl-q" type="button" data-h="12">12ч</button>
+            <button class="tl-q" type="button" data-h="24">24ч</button>
+          </div>
+        </label>
+        <label class="tl-field">Ускорение, ×
+          <div class="tl-speed-row">
+            <input id="tl-speed" type="number" min="2" step="1" value="120" inputmode="numeric" />
+            <div class="tl-speed-quick">
+              <button class="tl-s" type="button" data-s="60">60</button>
+              <button class="tl-s" type="button" data-s="120">120</button>
+              <button class="tl-s" type="button" data-s="240">240</button>
+              <button class="tl-s" type="button" data-s="480">480</button>
+              <button class="tl-s" type="button" data-s="960">960</button>
+            </div>
+          </div>
+        </label>
+        <label class="tl-smooth"><input id="tl-smooth" type="checkbox" /> плавно (медленнее)</label>
+        <div id="tl-summary" class="tl-summary">—</div>
         <div class="tl-actions">
           <button id="tl-view" class="tl-btn tl-primary">▶ Смотреть</button>
           <button id="tl-download" class="tl-btn">⬇ Скачать</button>
